@@ -1,4 +1,9 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,13 +19,43 @@ from app.models import Ticket, SpamSender, PendingEdit
 from app.tasks.ticket_tasks import send_final_reply, close_ticket
 from app.scheduler import scheduler
 from datetime import datetime, timedelta
-from sqlalchemy import select
+from sqlalchemy import select, func
+
+# Global start time
+START_TIME = datetime.utcnow()
 
 application = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот запущен.")
+    keyboard = [["Status"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text("Бот запущен.", reply_markup=reply_markup)
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with AsyncSessionLocal() as session:
+        processed = await session.scalar(select(func.count()).select_from(Ticket))
+        sent = await session.scalar(
+            select(func.count())
+            .select_from(Ticket)
+            .where(Ticket.status.in_(["awaiting_client", "closed"]))
+        )
+        pending = await session.scalar(
+            select(func.count())
+            .select_from(Ticket)
+            .where(Ticket.status == "awaiting_operator")
+        )
+
+    uptime = datetime.utcnow() - START_TIME
+    text = (
+        f"⚙️ Статус системы:\n\n"
+        f"⏳ Uptime: {str(uptime).split('.')[0]}\n"
+        f"📦 Processed: {processed or 0}\n"
+        f"📤 Sent: {sent or 0}\n"
+        f"📥 Pending: {pending or 0}"
+    )
+    await update.message.reply_text(text)
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -96,6 +131,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def setup_bot_handlers():
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("status", status))
+    application.add_handler(MessageHandler(filters.Text(["Status"]), status))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
