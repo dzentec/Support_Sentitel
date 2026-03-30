@@ -149,8 +149,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await session.merge(pending)
                 await session.commit()
+
+                # Обновляем сообщение и отправляем черновик для редактирования
                 await query.edit_message_text(
-                    "✏️ Редактирование начато. Напишите новый текст ответа."
+                    "✏️ Редактирование начато. Ответьте на следующее сообщение с вашим исправленным текстом:"
+                )
+                # Отправляем черновик как отдельное сообщение для удобного Reply/Quote
+                await query.message.reply_text(
+                    f"```\n{ticket.ai_draft}\n```", parse_mode="Markdown"
                 )
 
     except Exception as e:
