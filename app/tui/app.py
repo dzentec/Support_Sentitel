@@ -1,3 +1,11 @@
+import sys
+import os
+
+# Fix imports for direct execution
+sys.path.append(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Log, DataTable, Static
 from textual.containers import Container, Vertical, Horizontal
@@ -12,7 +20,8 @@ class SupportTUI(App):
     TITLE = "NEW TUI v3.3"
     BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh")]
     CSS = """
-        #stats { height: 3; background: $surface; color: $text; }
+        #spacer-above { height: 1; }
+        #stats { height: 1; background: $surface; color: $text; }
         .stat-item { padding: 0 1; width: auto; }
         #logs { height: 1fr; border: solid $primary; }
         #tickets { height: 1fr; border: solid $secondary; }
@@ -20,6 +29,7 @@ class SupportTUI(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        yield Static("", id="spacer-above")
         yield Horizontal(
             Static("⏳ Uptime: --", id="uptime", classes="stat-item"),
             Static("📦 Processed: 0", id="processed", classes="stat-item"),
