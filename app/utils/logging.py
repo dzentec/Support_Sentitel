@@ -3,19 +3,28 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 
+# Define logger at module level
+logger = structlog.get_logger()
+
 
 def setup_logging():
-    log_dir = "/app/logs"
+    log_dir = "logs"  # Use local directory
     os.makedirs(log_dir, exist_ok=True)
 
     file_info = RotatingFileHandler(
-        f"{log_dir}/app.log", maxBytes=10 * 1024 * 1024, backupCount=5
+        f"{log_dir}/app.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
     file_debug = RotatingFileHandler(
-        f"{log_dir}/debug.log", maxBytes=10 * 1024 * 1024, backupCount=5
+        f"{log_dir}/debug.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
     )
     file_error = RotatingFileHandler(
-        f"{log_dir}/error.log", maxBytes=10 * 1024 * 1024, backupCount=5
+        f"{log_dir}/error.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
     )
 
     file_info.setLevel(logging.INFO)
