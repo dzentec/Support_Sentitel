@@ -1,3 +1,30 @@
 # AI Support Sentinel v3.3
 
-Automated email support system using FastAPI, SQLite, Gemini, and Telegram.
+Автоматизированная система обработки входящих обращений по email, работающая в одном контейнере.
+
+## Основные возможности
+
+- **Автоматизация**: IMAP polling, фильтрация спама через Gemini, авто-ответы клиентам.
+- **Поддержка**: Интеграция с Telegram для управления тикетами (одобрение, редактирование, откладывание).
+- **Надёжность**: SQLite с WAL, персистентный планировщик APScheduler, механизмы fallback при ошибках.
+- **Мониторинг**: Структурированное логирование и TUI для отладки.
+
+## Стек технологий
+
+- Python 3.11
+- FastAPI
+- SQLite
+- APScheduler
+- Google Gemini Flash 1.5
+- Telegram Bot API
+- Textual (TUI)
+- Docker & Docker Compose
+
+## Развёртывание
+
+1. Склонируйте репозиторий.
+2. Создайте `.env` на основе `.env.example` и заполните переменные.
+3. Запустите систему: `docker-compose up -d`
+
+---
+Разработано для Lumiring.
