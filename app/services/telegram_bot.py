@@ -115,7 +115,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("Спам", callback_data=f"spam|{ticket.id}")],
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                text = f"🎫 Тикет #{ticket.id}\nОт: {ticket.sender_name}\nТема: {ticket.subject}\n\nЧерновик:\n{ticket.ai_draft}"
+
+                name = ticket.sender_name or "Unknown"
+                subject = ticket.subject or "(no subject)"
+                draft = ticket.ai_draft or "No draft available."
+
+                text = f"🎫 Тикет #{ticket.id}\nОт: {name}\nТема: {subject}\n\nЧерновик:\n{draft}"
                 await query.edit_message_text(text, reply_markup=reply_markup)
 
             elif action == "approve":
@@ -138,10 +143,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
             elif action == "edit":
+                # Используем merge для обновления или создания записи
                 pending = PendingEdit(
                     chat_id=query.message.chat_id, ticket_id=ticket.id
                 )
-                session.add(pending)
+                await session.merge(pending)
                 await session.commit()
                 await query.edit_message_text(
                     "✏️ Редактирование начато. Напишите новый текст ответа."
@@ -185,10 +191,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await session.commit()
 
 
-async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"DEBUG UPDATE: {update}")
-
-
 def setup_bot_handlers():
     logger.info("Registering bot handlers...")
 
@@ -209,7 +211,3 @@ def setup_bot_handlers():
         MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
     )
     logger.info("All handlers registered successfully.")
-
-
-async def set_webhook():
-    await application.bot.set_webhook(f"{settings.WEBHOOK_URL}/webhook/tg")
