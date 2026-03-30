@@ -18,10 +18,13 @@ from app.config import settings
 
 
 class SupportTUI(App):
-    TITLE = "NEW TUI v3.3"
-    BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh")]
+    TITLE = "AI Support Sentinel v3.3"
+    BINDINGS = [
+        ("q", "quit", "Quit"),
+        ("r", "refresh", "Refresh"),
+        ("l", "cycle_log_level", "Cycle Log Level"),
+    ]
     CSS = """
-        #spacer-above { height: 1; }
         #stats { height: 1; background: $surface; color: $text; }
         .stat-item { padding: 0 1; width: auto; }
         #mode { width: 1fr; text-align: right; }
@@ -31,7 +34,6 @@ class SupportTUI(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("", id="spacer-above")
         yield Horizontal(
             Static("⏳ Uptime: --", id="uptime", classes="stat-item"),
             Static("📦 Processed: 0", id="processed", classes="stat-item"),
@@ -43,6 +45,14 @@ class SupportTUI(App):
         yield Log(id="logs")
         yield DataTable(id="tickets")
         yield Footer()
+
+    def action_cycle_log_level(self) -> None:
+        levels = ["DEBUG", "INFO", "WARNING", "ERROR"]
+        current = settings.LOG_LEVEL
+        next_level = levels[(levels.index(current) + 1) % len(levels)]
+        settings.LOG_LEVEL = next_level
+        self.query_one("#mode", Static).update(f"⚙️ Mode: {settings.LOG_LEVEL}")
+        self.query_one("#logs", Log).write(f"Log level changed to {next_level}\n")
 
     def on_mount(self) -> None:
         self.start_time = datetime.now()
