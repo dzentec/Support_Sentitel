@@ -1,10 +1,10 @@
 import sys
 import os
 
-# Fix imports for direct execution
-sys.path.append(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-)
+# Fix imports for direct execution by inserting project root at the start of sys.path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Log, DataTable, Static
@@ -14,6 +14,7 @@ import asyncio
 import os
 import json
 from datetime import datetime
+from app.config import settings
 
 
 class SupportTUI(App):
@@ -23,6 +24,7 @@ class SupportTUI(App):
         #spacer-above { height: 1; }
         #stats { height: 1; background: $surface; color: $text; }
         .stat-item { padding: 0 1; width: auto; }
+        #mode { width: 1fr; text-align: right; }
         #logs { height: 1fr; border: solid $primary; }
         #tickets { height: 1fr; border: solid $secondary; }
     """
@@ -35,6 +37,7 @@ class SupportTUI(App):
             Static("📦 Processed: 0", id="processed", classes="stat-item"),
             Static("📤 Sent: 0", id="sent", classes="stat-item"),
             Static("📥 Pending: 0", id="pending", classes="stat-item"),
+            Static(f"⚙️ Mode: {settings.LOG_LEVEL}", id="mode", classes="stat-item"),
             id="stats",
         )
         yield Log(id="logs")
@@ -91,9 +94,9 @@ class SupportTUI(App):
                         level = data.get("log_level", "INFO")
                         event = data.get("event", "")
                         emoji = emoji_map.get(level, "📝")
-                        log_widget.write(f"[{timestamp}] {emoji} {level} {event}")
+                        log_widget.write(f"[{timestamp}] {emoji} {level} {event}\n")
                     except json.JSONDecodeError:
-                        log_widget.write(line.strip())
+                        log_widget.write(line.strip() + "\n")
 
 
 if __name__ == "__main__":
