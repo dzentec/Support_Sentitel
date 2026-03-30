@@ -9,28 +9,26 @@ from datetime import datetime
 
 
 class SupportTUI(App):
+    TITLE = "NEW TUI v3.3"
     BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh")]
     CSS = """
-        #stats { height: 3; dock: top; background: $surface; padding: 0 1; }
-        .stat-item { padding: 0 1; }
+        #stats { height: 3; background: $surface; color: $text; }
+        .stat-item { padding: 0 1; width: auto; }
+        #logs { height: 1fr; border: solid $primary; }
+        #tickets { height: 1fr; border: solid $secondary; }
     """
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Horizontal(
-            Static("Uptime: --", id="uptime"),
-            Static("Processed: 0", id="processed"),
-            Static("Sent: 0", id="sent"),
-            Static("Pending: 0", id="pending"),
+            Static("⏳ Uptime: --", id="uptime", classes="stat-item"),
+            Static("📦 Processed: 0", id="processed", classes="stat-item"),
+            Static("📤 Sent: 0", id="sent", classes="stat-item"),
+            Static("📥 Pending: 0", id="pending", classes="stat-item"),
             id="stats",
         )
-        yield Container(
-            Vertical(
-                Log(id="logs", classes="box"),
-                DataTable(id="tickets", classes="box"),
-                id="main",
-            )
-        )
+        yield Log(id="logs")
+        yield DataTable(id="tickets")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -42,12 +40,15 @@ class SupportTUI(App):
 
     def update_header(self):
         uptime = datetime.now() - self.start_time
-        self.query_one("#uptime", Static).update(f"Uptime: {str(uptime).split('.')[0]}")
+        self.query_one("#uptime", Static).update(
+            f"⏳ Uptime: {str(uptime).split('.')[0]}"
+        )
 
     async def update_stats(self):
         while True:
             try:
-                async with aiosqlite.connect("data/support.db") as db:
+                db_path = os.path.join(os.getcwd(), "data", "support.db")
+                async with aiosqlite.connect(db_path) as db:
                     processed = await db.execute_scalar("SELECT COUNT(*) FROM tickets")
                     sent = await db.execute_scalar(
                         "SELECT COUNT(*) FROM tickets WHERE status IN ('awaiting_client', 'closed')"
@@ -57,12 +58,12 @@ class SupportTUI(App):
                     )
 
                     self.query_one("#processed", Static).update(
-                        f"Processed: {processed}"
+                        f"📦 Processed: {processed}"
                     )
-                    self.query_one("#sent", Static).update(f"Sent: {sent}")
-                    self.query_one("#pending", Static).update(f"Pending: {pending}")
+                    self.query_one("#sent", Static).update(f"📤 Sent: {sent}")
+                    self.query_one("#pending", Static).update(f"📥 Pending: {pending}")
             except Exception as e:
-                pass  # Silent fail for TUI stats
+                pass
             await asyncio.sleep(10)
 
     def update_logs(self):
@@ -72,13 +73,15 @@ class SupportTUI(App):
                 lines = f.readlines()[-20:]
                 log_widget = self.query_one("#logs", Log)
                 log_widget.clear()
+                emoji_map = {"INFO": "ℹ️", "DEBUG": "🔍", "ERROR": "❌", "WARNING": "⚠️"}
                 for line in lines:
                     try:
                         data = json.loads(line)
                         timestamp = data.get("timestamp", "").replace("T", " ")[:19]
                         level = data.get("log_level", "INFO")
                         event = data.get("event", "")
-                        log_widget.write(f"[{timestamp}] [{level}] {event}")
+                        emoji = emoji_map.get(level, "📝")
+                        log_widget.write(f"[{timestamp}] {emoji} {level} {event}")
                     except json.JSONDecodeError:
                         log_widget.write(line.strip())
 
