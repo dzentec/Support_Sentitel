@@ -85,6 +85,23 @@ async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=reply_markup)
 
 
+async def send_ticket_details(bot, chat_id, ticket):
+    keyboard = [
+        [
+            InlineKeyboardButton("Одобрить", callback_data=f"approve|{ticket.id}"),
+            InlineKeyboardButton("Редактировать", callback_data=f"edit|{ticket.id}"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    name = ticket.sender_name or "Unknown"
+    subject = ticket.subject or "(no subject)"
+    draft = ticket.ai_draft or "No draft available."
+
+    text = f"🎫 Тикет #{ticket.id}\nОт: {name}\nТема: {subject}\n\nЧерновик:\n{draft}"
+    await bot.send_message(chat_id, text, reply_markup=reply_markup)
+
+
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     print(f"DEBUG: Callback received! Data: {query.data}")
@@ -103,25 +120,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if action == "show":
-                keyboard = [
-                    [
-                        InlineKeyboardButton(
-                            "Одобрить", callback_data=f"approve|{ticket.id}"
-                        ),
-                        InlineKeyboardButton(
-                            "Редактировать", callback_data=f"edit|{ticket.id}"
-                        ),
-                    ],
-                    [InlineKeyboardButton("Спам", callback_data=f"spam|{ticket.id}")],
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-
-                name = ticket.sender_name or "Unknown"
-                subject = ticket.subject or "(no subject)"
-                draft = ticket.ai_draft or "No draft available."
-
-                text = f"🎫 Тикет #{ticket.id}\nОт: {name}\nТема: {subject}\n\nЧерновик:\n{draft}"
-                await query.edit_message_text(text, reply_markup=reply_markup)
+                await query.delete_message()
+                await send_ticket_details(context.bot, query.message.chat_id, ticket)
 
             elif action == "approve":
                 await send_final_reply(ticket, ticket.ai_draft)
@@ -153,17 +153,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "✏️ Редактирование начато. Напишите новый текст ответа."
                 )
 
-            elif action == "spam":
-                ticket.status = "spam_confirmed"
-                spammer = SpamSender(
-                    email=ticket.sender_email, reason="confirmed by operator"
-                )
-                session.add(spammer)
-                await session.commit()
-                await query.edit_message_text(
-                    f"🚫 Тикет #{ticket.id} помечен как спам."
-                )
-
     except Exception as e:
         logger.error(f"Callback Error: {e}", exc_info=True)
         await query.message.reply_text(f"Ошибка: {e}")
@@ -172,23 +161,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg.reply_to_message:
+        logger.info("Message handler: no reply_to_message")
         return
 
     async with AsyncSessionLocal() as session:
+        logger.info(f"Looking for PendingEdit for chat_id: {msg.chat_id}")
+
         result = await session.execute(
             select(PendingEdit).where(PendingEdit.chat_id == msg.chat_id)
         )
         pending = result.scalar_one_or_none()
+
         if pending:
+            logger.info(f"Found pending edit for ticket: {pending.ticket_id}")
             ticket = await session.get(Ticket, pending.ticket_id)
             if ticket:
-                await send_final_reply(ticket, msg.text)
-                ticket.status = "awaiting_client"
-                ticket.replied_at = datetime.utcnow()
+                ticket.ai_draft = msg.text
                 await session.commit()
-                await msg.reply_text("✅ Ответ отправлен.")
+
                 await session.delete(pending)
                 await session.commit()
+
+                await msg.reply_text("✅ Черновик обновлен.")
+                # Вызов отправки карточки
+                await send_ticket_details(context.bot, msg.chat_id, ticket)
+                logger.info("Sent updated ticket details to operator")
+            else:
+                logger.error("Pending record found, but ticket not found in DB")
+        else:
+            logger.info("No pending edit found for this chat")
 
 
 def setup_bot_handlers():
