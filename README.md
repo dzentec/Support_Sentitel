@@ -1,15 +1,15 @@
 # 🤖 AI Support Sentinel v3.3
 
-Автоматизированная система обработки входящих обращений по email, работающая в одном контейнере. 🚀
+An automated email support handling system, running in a single container. 🚀
 
-## ✨ Основные возможности
+## ✨ Key Features
 
-- 📧 **Автоматизация**: IMAP polling, фильтрация спама через Gemini, авто-ответы клиентам.
-- 💬 **Поддержка**: Интеграция с Telegram для управления тикетами (одобрение, редактирование, откладывание).
-- 🛡️ **Надёжность**: SQLite с WAL, персистентный планировщик APScheduler, механизмы fallback при ошибках.
-- 📊 **Мониторинг**: Структурированное логирование и интерактивный TUI для отладки.
+- 📧 **Automation**: IMAP polling, spam filtering with Gemini, auto-replies to customers.
+- 💬 **Support**: Telegram integration for ticket management (approve, edit, snooze).
+- 🛡️ **Reliability**: SQLite with WAL, persistent APScheduler task management, and robust error fallback mechanisms.
+- 📊 **Monitoring**: Structured logging and an interactive TUI for real-time debugging.
 
-## 🛠️ Стек технологий
+## 🛠️ Technology Stack
 
 - 🐍 Python 3.11
 - ⚡ FastAPI
@@ -19,11 +19,11 @@
 - 🖥️ Textual (TUI)
 - 🐳 Docker & Docker Compose
 
-## 🚀 Развёртывание
+## 🚀 Deployment
 
-1. Склонируйте репозиторий.
-2. Создайте `.env` на основе `.env.example` и заполните переменные.
-3. Запустите систему: `docker-compose up -d`
+1. Clone the repository.
+2. Create a `.env` file based on `.env.example` and fill in your variables.
+3. Start the system: `docker-compose up -d`
 
 ---
-*Разработано для Lumiring.*
+*Developed for Lumiring.*
