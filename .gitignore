@@ -1,0 +1,17 @@
+# Framework metadata
+_bmad/
+.opencode/
+.bin/
+# Env
+.env
+# DB
+data/
+# Logs
+logs/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.env.example
+.pytest_cache/
