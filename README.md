@@ -12,7 +12,15 @@ An automated email support handling system, running in a single container. 🚀
 - ⚙️ **Configurable**: Adjustable IMAP polling intervals and escalation thresholds.
 
 ## 🛠️ Technology Stack
-...
+## 🛠️ Technology Stack
+
+- 🐍 Python 3.11
+- ⚡ FastAPI
+- 💾 SQLite
+- 🤖 Google Gemini 2.5 Flash-lite
+- ✈️ Telegram Bot API
+- 🖥️ Textual (TUI)
+- 🐳 Docker & Docker Compose
 ## 🚀 Deployment
 
 1. Clone the repository.
