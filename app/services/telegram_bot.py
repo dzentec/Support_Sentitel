@@ -5,18 +5,19 @@ from telegram import (
     ReplyKeyboardMarkup,
 )
 from telegram.ext import (
-    Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
     filters,
     ContextTypes,
 )
+from app.bot_instance import application
 from app.config import settings
 from app.utils.logging import logger
 from app.database import AsyncSessionLocal
 from app.models import Ticket, SpamSender, PendingEdit
 from app.tasks.ticket_tasks import send_final_reply, close_ticket
+from app.services.imap import poll_imap
 from app.scheduler import scheduler
 from datetime import datetime, timedelta
 from sqlalchemy import select, func
@@ -25,8 +26,7 @@ from app.services.templates import render_email_template
 # Global start time
 START_TIME = datetime.utcnow()
 
-application = Application.builder().token(settings.TELEGRAM_BOT_TOKEN).build()
-logger.info("Telegram bot application instance created.")
+logger.info("Telegram bot application instance imported.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -36,17 +36,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔄 Запускаю проверку почты...")
+    await poll_imap()
+    await update.message.reply_text("✅ Проверка почты завершена.")
+
     async with AsyncSessionLocal() as session:
         processed = await session.scalar(select(func.count()).select_from(Ticket))
         sent = await session.scalar(
             select(func.count())
             .select_from(Ticket)
-            .where(Ticket.status.in_(["awaiting_client", "closed"]))
+            .where(Ticket.status.in_(["pending", "closed"]))
         )
         pending = await session.scalar(
-            select(func.count())
-            .select_from(Ticket)
-            .where(Ticket.status == "awaiting_operator")
+            select(func.count()).select_from(Ticket).where(Ticket.status == "open")
         )
 
     uptime = datetime.utcnow() - START_TIME
@@ -63,7 +65,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(Ticket).where(Ticket.status == "awaiting_operator").limit(10)
+            select(Ticket).where(Ticket.status == "open").limit(10)
         )
         tickets = result.scalars().all()
 
@@ -148,12 +150,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             elif action == "approve":
                 await send_final_reply(ticket, ticket.ai_draft)
-                ticket.status = "awaiting_client"
+                ticket.status = "pending"
                 ticket.replied_at = datetime.utcnow()
                 await session.commit()
                 display_id = ticket.zoho_id or ticket.id
                 await query.edit_message_text(
-                    f"✅ Ответ отправлен на тикет #{display_id}"
+                    f"✅ Ответ отправлен на тикет #{display_id}. Статус: pending"
                 )
 
             elif action == "edit":

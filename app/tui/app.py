@@ -74,10 +74,10 @@ class SupportTUI(App):
                 async with aiosqlite.connect(db_path) as db:
                     processed = await db.execute_scalar("SELECT COUNT(*) FROM tickets")
                     sent = await db.execute_scalar(
-                        "SELECT COUNT(*) FROM tickets WHERE status IN ('awaiting_client', 'closed')"
+                        "SELECT COUNT(*) FROM tickets WHERE status IN ('pending', 'closed')"
                     )
                     pending = await db.execute_scalar(
-                        "SELECT COUNT(*) FROM tickets WHERE status = 'awaiting_operator'"
+                        "SELECT COUNT(*) FROM tickets WHERE status = 'open'"
                     )
 
                     self.query_one("#processed", Static).update(

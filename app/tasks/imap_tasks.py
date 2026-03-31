@@ -54,7 +54,7 @@ async def process_email(raw_email_bytes):
                 category=gemini_result.get("category"),
                 spam_confidence=gemini_result.get("confidence"),
                 ai_draft=gemini_result.get("draft_reply"),
-                status="awaiting_operator",
+                status="new",
             )
             session.add(ticket)
             await session.flush()

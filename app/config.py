@@ -25,6 +25,12 @@ class Settings:
     WHITELISTED_SENDERS = [
         s.strip() for s in os.getenv("WHITELISTED_SENDERS", "").split(",") if s.strip()
     ]
+    REMINDER_INTERVALS = [
+        int(x) for x in os.getenv("REMINDER_INTERVALS", "15,30,60").split(",")
+    ]
+    SUMMARY_INTERVAL = int(os.getenv("SUMMARY_INTERVAL", 120))
+    AUTO_CLOSE_TIMEOUT_HOURS = int(os.getenv("AUTO_CLOSE_TIMEOUT_HOURS", 72))
+    IMAP_POLL_INTERVAL = int(os.getenv("IMAP_POLL_INTERVAL", 5))
 
 
 settings = Settings()

@@ -1,9 +1,14 @@
 from fastapi import FastAPI
 from app.database import init_db
 from app.scheduler import start_scheduler, shutdown_scheduler
-from app.services.telegram_bot import application, setup_bot_handlers
+from app.services.telegram_bot import setup_bot_handlers
+from app.bot_instance import application
 from app.utils.logging import logger
 from contextlib import asynccontextmanager
+from app.services.imap import poll_imap
+from app.tasks.ticket_tasks import check_reminders, check_auto_close
+from app.config import settings
+from app.scheduler import scheduler
 
 
 @asynccontextmanager
@@ -11,6 +16,33 @@ async def lifespan(app: FastAPI):
     logger.info("Starting lifespan...")
     await init_db()
     start_scheduler()
+
+    # Регистрация задач
+    scheduler.add_job(
+        poll_imap,
+        "interval",
+        minutes=settings.IMAP_POLL_INTERVAL,
+        id="poll_imap",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        check_reminders,
+        "interval",
+        minutes=15,
+        id="check_reminders",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        check_auto_close,
+        "interval",
+        hours=1,
+        id="check_auto_close",
+        replace_existing=True,
+    )
+    logger.info(
+        f"Tasks scheduled. IMAP polling interval: {settings.IMAP_POLL_INTERVAL} min"
+    )
+
     setup_bot_handlers()
     # Инициализация приложения бота
     await application.initialize()

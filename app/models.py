@@ -31,7 +31,7 @@ class Ticket(Base):
     spam_confidence = Column(Float)
     ai_draft = Column(Text)
     final_reply = Column(Text)
-    status = Column(String, default="awaiting_operator")
+    status = Column(String, default="new")
     snooze_count = Column(Integer, default=0)
     snooze_until = Column(DateTime)
     tg_message_id = Column(Integer)
@@ -39,6 +39,7 @@ class Ticket(Base):
     tg_edit_prompt_msg_id = Column(Integer)
     close_job_id = Column(String)
     zoho_id = Column(String)  # NEW FIELD
+    reminders_sent_intervals = Column(String, default="")
     created_at = Column(DateTime, default=func.now())
     auto_reply_sent_at = Column(DateTime)
     operator_action_at = Column(DateTime)
