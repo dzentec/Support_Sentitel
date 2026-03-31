@@ -20,6 +20,7 @@ from app.tasks.ticket_tasks import send_final_reply, close_ticket
 from app.scheduler import scheduler
 from datetime import datetime, timedelta
 from sqlalchemy import select, func
+from app.services.templates import render_email_template
 
 # Global start time
 START_TIME = datetime.utcnow()
@@ -89,9 +90,17 @@ async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_ticket_details(bot, chat_id, ticket):
     keyboard = [
         [
+            InlineKeyboardButton(
+                "Query Tech spec ACS", callback_data=f"query_acs|{ticket.id}"
+            ),
+            InlineKeyboardButton(
+                "Query Tech spec WW", callback_data=f"query_ww|{ticket.id}"
+            ),
+        ],
+        [
             InlineKeyboardButton("Одобрить", callback_data=f"approve|{ticket.id}"),
             InlineKeyboardButton("Редактировать", callback_data=f"edit|{ticket.id}"),
-        ]
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -125,23 +134,26 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.delete_message()
                 await send_ticket_details(context.bot, query.message.chat_id, ticket)
 
+            elif action in ["query_acs", "query_ww"]:
+                template = (
+                    "tech_query.txt" if action == "query_acs" else "tech_query_ww.txt"
+                )
+                draft = render_email_template(
+                    template, {"ticket_id": ticket.zoho_id or ticket.id}
+                )
+                ticket.ai_draft = draft
+                await session.commit()
+                await query.delete_message()
+                await send_ticket_details(context.bot, query.message.chat_id, ticket)
+
             elif action == "approve":
                 await send_final_reply(ticket, ticket.ai_draft)
                 ticket.status = "awaiting_client"
                 ticket.replied_at = datetime.utcnow()
-
-                job_id = f"close_ticket_{ticket.id}"
-                scheduler.add_job(
-                    close_ticket,
-                    "date",
-                    run_date=datetime.utcnow() + timedelta(hours=48),
-                    id=job_id,
-                    args=[ticket.id],
-                )
-                ticket.close_job_id = job_id
                 await session.commit()
+                display_id = ticket.zoho_id or ticket.id
                 await query.edit_message_text(
-                    f"✅ Ответ отправлен на тикет #{ticket.id}"
+                    f"✅ Ответ отправлен на тикет #{display_id}"
                 )
 
             elif action == "edit":

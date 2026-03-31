@@ -1,0 +1,15 @@
+Hello,
+
+To help our engineers resolve the issue with your device, please provide the following technical details:
+
+1. Firmware Version: [Available on device screen]
+2. Power Specs: [Voltage and current for both the Master and Slave devices]
+3. Device Distance: [Distance between Master and Slave devices]
+4. Signal Strength: [Available on device screen]
+5. Antenna Type: [Stock antenna or a custom one]
+6. Installation Photos: [If possible, please attach photos of the mounting and wiring]
+
+This information will help us resolve your problem much faster.
+
+Best regards,
+Lumiring Support Team

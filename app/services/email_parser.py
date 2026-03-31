@@ -33,6 +33,15 @@ def normalize_email(raw_email_bytes):
 
     body_for_ai = body[:4000] if len(body) > 4000 else body
 
+    # Извлечение данных Zoho (ищем в первом абзаце)
+    zoho_match = re.search(r"#(\d+)\s+(.*)", body)
+    if zoho_match:
+        zoho_id = zoho_match.group(1)
+        extracted_subject = f"#{zoho_id} {zoho_match.group(2)}"
+    else:
+        zoho_id = None
+        extracted_subject = subject
+
     all_refs = []
     if references:
         all_refs.extend(references)
@@ -41,9 +50,10 @@ def normalize_email(raw_email_bytes):
 
     return {
         "message_id": message_id,
+        "zoho_id": zoho_id,
         "sender_email": sender_email,
         "sender_name": sender_name,
-        "subject": subject,
+        "subject": extracted_subject,
         "body_normalized": body,
         "body_for_ai": body_for_ai,
         "body_raw": body,

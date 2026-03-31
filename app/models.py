@@ -38,6 +38,7 @@ class Ticket(Base):
     tg_chat_id = Column(Integer)
     tg_edit_prompt_msg_id = Column(Integer)
     close_job_id = Column(String)
+    zoho_id = Column(String)  # NEW FIELD
     created_at = Column(DateTime, default=func.now())
     auto_reply_sent_at = Column(DateTime)
     operator_action_at = Column(DateTime)

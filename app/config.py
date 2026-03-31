@@ -21,6 +21,10 @@ class Settings:
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/support.db")
     SCHEDULER_DB_URL = os.getenv("SCHEDULER_DB_URL", "sqlite:///./data/scheduler.db")
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    TEST_MODE = os.getenv("TEST_MODE", "False").lower() == "true"
+    WHITELISTED_SENDERS = [
+        s.strip() for s in os.getenv("WHITELISTED_SENDERS", "").split(",") if s.strip()
+    ]
 
 
 settings = Settings()

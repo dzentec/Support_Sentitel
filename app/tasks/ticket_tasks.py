@@ -1,7 +1,9 @@
 import json
-import json
 from datetime import datetime, timedelta
-# ... (rest of imports)
+from app.database import AsyncSessionLocal
+from app.models import Ticket
+from app.services.smtp import send_email
+from sqlalchemy import select
 
 
 async def send_final_reply(ticket, text):

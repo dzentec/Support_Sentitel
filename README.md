@@ -5,7 +5,7 @@ An automated email support handling system, running in a single container. 🚀
 ## ✨ Key Features
 
 - 📧 **Automation**: IMAP polling, spam filtering with Gemini, auto-replies to customers.
-- 💬 **Support**: Telegram integration for ticket management (approve, edit, snooze).
+- 💬 **Support**: Telegram integration for ticket management (approve, edit, snooze) and automated technical spec query templates.
 - 🛡️ **Reliability**: SQLite with WAL, persistent APScheduler task management, and robust error fallback mechanisms.
 - 📊 **Monitoring**: Structured logging and an interactive TUI for real-time debugging.
 

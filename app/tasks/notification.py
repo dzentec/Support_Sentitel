@@ -6,6 +6,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 async def notify_operator(ticket, ai_draft):
     keyboard = [
         [
+            InlineKeyboardButton(
+                "Query Tech spec ACS", callback_data=f"query_acs|{ticket.id}"
+            ),
+            InlineKeyboardButton(
+                "Query Tech spec WW", callback_data=f"query_ww|{ticket.id}"
+            ),
+        ],
+        [
             InlineKeyboardButton("Одобрить", callback_data=f"approve|{ticket.id}"),
             InlineKeyboardButton("Редактировать", callback_data=f"edit|{ticket.id}"),
         ],

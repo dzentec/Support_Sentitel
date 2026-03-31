@@ -29,6 +29,5 @@
       "command": [".bin\\codebase-memory-mcp.exe"],
       "enabled": true
     }
-  },
-  "plugin": ["@tarquinen/opencode-dcp@latest"]
+  }
 }

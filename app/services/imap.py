@@ -35,9 +35,9 @@ async def poll_imap():
 
                 await process_email(raw_email)
 
-                logger.info(
-                    f"Message {msg_id} processed (not marked as read via FETCH)."
-                )
+                # Отмечаем как прочитанное после успешной обработки
+                await client.store(msg_id, "+FLAGS", "\\Seen")
+                logger.info(f"Message {msg_id} processed and marked as read.")
 
             except Exception as e:
                 # Если письмо не обработалось, оно останется UNSEEN и будет попытка снова

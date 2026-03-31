@@ -51,9 +51,11 @@ async def send_email(
     )
 
     part1 = MIMEText(body_text, "plain", "utf-8")
-    part2 = MIMEText(body_html, "html", "utf-8")
     msg.attach(part1)
-    msg.attach(part2)
+
+    if body_html:
+        part2 = MIMEText(body_html, "html", "utf-8")
+        msg.attach(part2)
 
     try:
         await aiosmtplib.send(

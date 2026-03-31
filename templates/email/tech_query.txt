@@ -1,0 +1,19 @@
+Hello,
+
+Thank you for reaching out to Lumiring Support.
+
+Our engineers need the following details to resolve the controller/reader error reported in ticket #{{ ticket_id }}:
+
+1. Firmware Version: [Controller firmware]
+2. Power Specs: [Voltage/Current for controller & reader]
+3. Interface: [Wiegand or OSDP]
+4. Lock Wiring: [Relay/Output point]
+5. Configuration: [Brief description of control point setup]
+6. AllDoors Account: [Your login/email]
+
+Please reply to this email with the requested information so we can take a closer look at your system.
+
+We appreciate your patience.
+
+Best regards,
+Lumiring Support Team
