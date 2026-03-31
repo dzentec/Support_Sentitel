@@ -1,0 +1,9 @@
+Hello, {{ sender_name }}!
+
+Your ticket #{{ ticket_id }} has not received a response for 48 hours.
+We have closed the request.
+
+If your issue is still pending, please reply to this email to reopen the ticket.
+
+Best regards,
+Support Team

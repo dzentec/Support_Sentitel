@@ -1,0 +1,8 @@
+Hello, {{ sender_name }}!
+
+We have prepared a response regarding your ticket #{{ ticket_id }}:
+
+{{ final_reply }}
+
+Best regards,
+Support Team

@@ -22,11 +22,11 @@ async def poll_imap():
         msg_ids = [msg_id.decode("utf-8") for msg_id in data[0].split()]
         logger.info(f"Found {len(msg_ids)} new unread messages.")
 
-        # Ограничимся обработкой только первого письма для теста
-        for msg_id in msg_ids[:1]:
+        # Обрабатываем все письма от новых к старым
+        for msg_id in reversed(msg_ids):
             try:
                 logger.info(f"Fetching message {msg_id}")
-                _, msg_data = await client.fetch(msg_id, "(RFC822)")
+                _, msg_data = await client.fetch(str(msg_id), "(BODY.PEEK[])")
                 # Проверяем, что msg_data содержит данные (иногда сервер возвращает другой формат)
                 if len(msg_data) < 2:
                     logger.error(f"Message {msg_id} returned no data: {msg_data}")
@@ -35,11 +35,12 @@ async def poll_imap():
 
                 await process_email(raw_email)
 
-                await client.store(msg_id, "+FLAGS", "\\Seen")
-
-                logger.info(f"Message {msg_id} processed and marked as read.")
+                logger.info(
+                    f"Message {msg_id} processed (not marked as read via FETCH)."
+                )
 
             except Exception as e:
+                # Если письмо не обработалось, оно останется UNSEEN и будет попытка снова
                 logger.error(f"Failed to process message {msg_id}: {e}")
 
         await client.logout()

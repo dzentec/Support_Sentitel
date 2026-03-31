@@ -1,0 +1,6 @@
+Notification: New message in ticket #{{ ticket_id }}.
+
+Subject: {{ subject }}
+From: {{ sender_name }}
+
+Please check the ticket in your control panel.
