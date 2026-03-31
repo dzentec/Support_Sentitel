@@ -29,13 +29,31 @@ START_TIME = datetime.utcnow()
 logger.info("Telegram bot application instance imported.")
 
 
+async def check_access(update: Update):
+    user_id = update.effective_user.id
+    if user_id not in settings.ALLOWED_TELEGRAM_IDS:
+        logger.warning(f"Unauthorized access attempt from user_id: {user_id}")
+        if update.message:
+            await update.message.reply_text(f"Access denied. Your ID: {user_id}")
+        elif update.callback_query:
+            await update.callback_query.answer(
+                f"Access denied. Your ID: {user_id}", show_alert=True
+            )
+        return False
+    return True
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
     keyboard = [["Status", "Pending", "New & Open"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text("Bot started.", reply_markup=reply_markup)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
     async with AsyncSessionLocal() as session:
         # Counters by new statuses: New, Open, Pending, Closed
         new_count = await session.scalar(
@@ -68,6 +86,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Ticket).where(Ticket.status == "pending").limit(10)
@@ -83,6 +103,8 @@ async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def list_new_and_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Ticket).where(Ticket.status.in_(["new", "open"])).limit(10)
@@ -142,6 +164,8 @@ async def send_ticket_details(bot, chat_id, ticket):
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
     query = update.callback_query
     print(f"DEBUG: Callback received! Data: {query.data}")
     logger.info(f"Callback received: {query.data}")
@@ -219,6 +243,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        return
     msg = update.message
     if not msg.reply_to_message:
         logger.info("Message handler: no reply_to_message")

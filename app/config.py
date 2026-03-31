@@ -31,6 +31,11 @@ class Settings:
     SUMMARY_INTERVAL = int(os.getenv("SUMMARY_INTERVAL", 120))
     AUTO_CLOSE_TIMEOUT_HOURS = int(os.getenv("AUTO_CLOSE_TIMEOUT_HOURS", 72))
     IMAP_POLL_INTERVAL = int(os.getenv("IMAP_POLL_INTERVAL", 5))
+    ALLOWED_TELEGRAM_IDS = [
+        int(s.strip())
+        for s in os.getenv("ALLOWED_TELEGRAM_IDS", "").split(",")
+        if s.strip()
+    ]
 
 
 settings = Settings()
