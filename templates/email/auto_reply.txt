@@ -1,13 +1,13 @@
-# auto_reply.txt
-Тема: Ваш запрос получен [Ticket #{{ ticket_id }}]
+Hello,
 
-Здравствуйте, {{ sender_name }}!
+Thank you for reaching out to Lumiring Support.
 
-Ваше обращение зафиксировано и передано в службу технической поддержки.
-Мы свяжемся с вами в ближайшее время.
+We have successfully received your request regarding "{{ subject }}". This has been assigned Ticket ID: #{{ ticket_id }} and forwarded to our technical department for a detailed review.
 
-Номер обращения: #{{ ticket_id }}
-Тема: {{ subject }}
+Our team is currently investigating the issue.
+If you have additional details or logs to share, simply reply to this email.
 
-С уважением,
-Команда поддержки
+We appreciate your patience.
+
+Best regards,
+Lumiring Support Team
