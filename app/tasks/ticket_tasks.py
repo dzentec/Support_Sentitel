@@ -1,14 +1,27 @@
+import json
+import json
 from datetime import datetime, timedelta
-from app.database import AsyncSessionLocal
-from app.models import Ticket
-from app.services.smtp import send_email
-from sqlalchemy import select
+# ... (rest of imports)
 
 
 async def send_final_reply(ticket, text):
     subject = f"Re: {ticket.subject}"
-    await send_email(ticket.sender_email, subject, text)
-    ticket.final_reply = text
+    final_text = text if text else "Thank you for your request. We are processing it."
+
+    # Parse JSON string from DB to list
+    references = (
+        json.loads(ticket.thread_references) if ticket.thread_references else None
+    )
+
+    # Передаем заголовки для ветки
+    await send_email(
+        ticket.sender_email,
+        subject,
+        final_text,
+        in_reply_to=ticket.message_id,
+        references=references,
+    )
+    ticket.final_reply = final_text
 
 
 async def close_ticket(ticket_id):

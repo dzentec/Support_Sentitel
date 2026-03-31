@@ -44,6 +44,7 @@ async def process_email(raw_email_bytes):
         try:
             ticket = Ticket(
                 message_id=msg_id,
+                zoho_id=email_data.get("zoho_id"),
                 thread_references=json.dumps(email_data["thread_references"]),
                 sender_email=email_data["sender_email"],
                 sender_name=email_data["sender_name"],
@@ -68,7 +69,14 @@ async def process_email(raw_email_bytes):
                     "subject": ticket.subject,
                 },
             )
-            await send_email(ticket.sender_email, subject, body)
+            # Передаем In-Reply-To и References
+            await send_email(
+                ticket.sender_email,
+                subject,
+                body,
+                in_reply_to=email_data["message_id"],
+                references=email_data["thread_references"],
+            )
 
             event = TicketEvent(ticket_id=ticket.id, event_type="ticket_created")
             session.add(event)
