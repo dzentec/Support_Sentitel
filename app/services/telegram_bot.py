@@ -30,59 +30,83 @@ logger.info("Telegram bot application instance imported.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [["Status", "Pending"]]
+    keyboard = [["Status", "Pending", "New & Open"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("Бот запущен.", reply_markup=reply_markup)
+    await update.message.reply_text("Bot started.", reply_markup=reply_markup)
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔄 Запускаю проверку почты...")
-    await poll_imap()
-    await update.message.reply_text("✅ Проверка почты завершена.")
-
     async with AsyncSessionLocal() as session:
-        processed = await session.scalar(select(func.count()).select_from(Ticket))
-        sent = await session.scalar(
-            select(func.count())
-            .select_from(Ticket)
-            .where(Ticket.status.in_(["pending", "closed"]))
+        # Counters by new statuses: New, Open, Pending, Closed
+        new_count = await session.scalar(
+            select(func.count()).select_from(Ticket).where(Ticket.status == "new")
         )
-        pending = await session.scalar(
+        open_count = await session.scalar(
             select(func.count()).select_from(Ticket).where(Ticket.status == "open")
+        )
+        pending_count = await session.scalar(
+            select(func.count()).select_from(Ticket).where(Ticket.status == "pending")
+        )
+        closed_count = await session.scalar(
+            select(func.count()).select_from(Ticket).where(Ticket.status == "closed")
         )
 
     uptime = datetime.utcnow() - START_TIME
     text = (
-        f"⚙️ Статус системы:\n\n"
-        f"⏳ Uptime: {str(uptime).split('.')[0]}\n"
-        f"📦 Processed: {processed or 0}\n"
-        f"📤 Sent: {sent or 0}\n"
-        f"📥 Pending: {pending or 0}"
+        f"⚙️ System Status:\n\n"
+        f"⏱ Uptime: {str(uptime).split('.')[0]}\n"
+        f"🆕 New: {new_count or 0}\n"
+        f"📂 Open: {open_count or 0}\n"
+        f"⏳ Pending: {pending_count or 0}\n"
+        f"✅ Closed: {closed_count or 0}"
     )
-    await update.message.reply_text(text)
+
+    keyboard = [[InlineKeyboardButton("Check New Tickets", callback_data="check_now")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(text, reply_markup=reply_markup)
 
 
 async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(Ticket).where(Ticket.status == "open").limit(10)
+            select(Ticket).where(Ticket.status == "pending").limit(10)
         )
         tickets = result.scalars().all()
 
     if not tickets:
-        await update.message.reply_text("Нет активных тикетов в ожидании.")
+        await update.message.reply_text("No tickets in Pending status.")
         return
 
-    text = "📥 Активные тикеты (ожидают оператора):"
+    text = "⏳ Tickets Pending:"
+    await send_ticket_list(update, tickets, text)
+
+
+async def list_new_and_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Ticket).where(Ticket.status.in_(["new", "open"])).limit(10)
+        )
+        tickets = result.scalars().all()
+
+    if not tickets:
+        await update.message.reply_text("No New or Open tickets.")
+        return
+
+    text = "📂 Tickets in Progress (New & Open):"
+    await send_ticket_list(update, tickets, text)
+
+
+async def send_ticket_list(update, tickets, text):
     keyboard = []
     for t in tickets:
         display_id = t.zoho_id or t.id
+        # Add date/time to button text, format: DD/MM/YYYY HH:MM
+        time_str = t.replied_at.strftime("%d/%m/%Y %H:%M") if t.replied_at else "---"
+        # Since Telegram buttons don't support right alignment, we include the time at the end.
+        button_text = f"#{display_id} | {t.subject[:15]}... | {time_str}"
         keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"#{display_id} - {t.subject}", callback_data=f"show|{t.id}"
-                )
-            ]
+            [InlineKeyboardButton(button_text, callback_data=f"show|{t.id}")]
         )
 
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -100,8 +124,8 @@ async def send_ticket_details(bot, chat_id, ticket):
             ),
         ],
         [
-            InlineKeyboardButton("Одобрить", callback_data=f"approve|{ticket.id}"),
-            InlineKeyboardButton("Редактировать", callback_data=f"edit|{ticket.id}"),
+            InlineKeyboardButton("Approve", callback_data=f"approve|{ticket.id}"),
+            InlineKeyboardButton("Edit", callback_data=f"edit|{ticket.id}"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -111,7 +135,9 @@ async def send_ticket_details(bot, chat_id, ticket):
     draft = ticket.ai_draft or "No draft available."
     display_id = ticket.zoho_id or ticket.id
 
-    text = f"🎫 Тикет #{display_id}\nОт: {name}\nТема: {subject}\n\nЧерновик:\n{draft}"
+    text = (
+        f"🎫 Ticket #{display_id}\nFrom: {name}\nSubject: {subject}\n\nDraft:\n{draft}"
+    )
     await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
@@ -123,18 +149,30 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         data = query.data
-        action, ticket_id = data.split("|")
-        ticket_id = int(ticket_id)
+        if "|" in data:
+            action, ticket_id = data.split("|")
+            ticket_id = int(ticket_id)
+        else:
+            action = data
+            ticket_id = None
 
         async with AsyncSessionLocal() as session:
-            ticket = await session.get(Ticket, ticket_id)
-            if not ticket:
-                await query.edit_message_text("Тикет не найден.")
-                return
+            if ticket_id:
+                ticket = await session.get(Ticket, ticket_id)
+                if not ticket:
+                    await query.edit_message_text("Ticket not found.")
+                    return
+            else:
+                ticket = None
 
             if action == "show":
                 await query.delete_message()
                 await send_ticket_details(context.bot, query.message.chat_id, ticket)
+
+            elif action == "check_now":
+                await query.edit_message_text("🔄 Checking mail...")
+                await poll_imap()
+                await query.edit_message_text("✅ Check completed.")
 
             elif action in ["query_acs", "query_ww"]:
                 template = (
@@ -155,7 +193,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await session.commit()
                 display_id = ticket.zoho_id or ticket.id
                 await query.edit_message_text(
-                    f"✅ Ответ отправлен на тикет #{display_id}. Статус: pending"
+                    f"✅ Reply sent for ticket #{display_id}. Status: pending"
                 )
 
             elif action == "edit":
@@ -168,7 +206,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Обновляем сообщение и отправляем черновик для редактирования
                 await query.edit_message_text(
-                    "✏️ Редактирование начато. Ответьте на следующее сообщение с вашим исправленным текстом:"
+                    "✏️ Editing started. Reply to the next message with your corrected text:"
                 )
                 # Отправляем черновик как отдельное сообщение для удобного Reply/Quote
                 await query.message.reply_text(
@@ -177,7 +215,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Callback Error: {e}", exc_info=True)
-        await query.message.reply_text(f"Ошибка: {e}")
+        await query.message.reply_text(f"Error: {e}")
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,7 +242,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await session.delete(pending)
                 await session.commit()
 
-                await msg.reply_text("✅ Черновик обновлен.")
+                await msg.reply_text("✅ Draft updated.")
                 # Вызов отправки карточки
                 await send_ticket_details(context.bot, msg.chat_id, ticket)
                 logger.info("Sent updated ticket details to operator")
@@ -221,10 +259,14 @@ def setup_bot_handlers():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("pending", list_pending))
+    application.add_handler(CommandHandler("newopen", list_new_and_open))
 
     # 2. Обработка текстовых кнопок меню
     application.add_handler(MessageHandler(filters.Text(["Status"]), status))
     application.add_handler(MessageHandler(filters.Text(["Pending"]), list_pending))
+    application.add_handler(
+        MessageHandler(filters.Text(["New & Open"]), list_new_and_open)
+    )
 
     # 3. Регистрация CallbackQueryHandler
     application.add_handler(CallbackQueryHandler(callback_handler))
