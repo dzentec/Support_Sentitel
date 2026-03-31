@@ -1,5 +1,9 @@
 import aiosmtplib
-from email.message import EmailMessage
+import uuid
+import email.utils
+import email.policy
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from app.config import settings
 from app.utils.logging import logger
 
@@ -7,39 +11,53 @@ from app.utils.logging import logger
 def _ensure_brackets(msg_id):
     if not msg_id:
         return None
-    msg_id = msg_id.strip()
-    if not msg_id.startswith("<"):
-        msg_id = f"<{msg_id}"
-    if not msg_id.endswith(">"):
-        msg_id = f"{msg_id}>"
-    return msg_id
+    msg_id = str(msg_id).strip().replace("<", "").replace(">", "")
+    return f"<{msg_id}>"
 
 
 async def send_email(
     to, subject, body_text, body_html=None, in_reply_to=None, references=None
 ):
-    message = EmailMessage()
-    message["From"] = settings.SMTP_SENDER
-    message["To"] = to
-    message["Subject"] = subject
-    if in_reply_to:
-        message["In-Reply-To"] = _ensure_brackets(in_reply_to)
-    if references:
-        # References header should be a space-separated string
-        if isinstance(references, list):
-            message["References"] = " ".join(
-                [_ensure_brackets(ref) for ref in references if ref]
-            )
-        else:
-            message["References"] = _ensure_brackets(references)
+    # Создаем политику, которая не будет разбивать и кодировать заголовки
+    custom_policy = email.policy.default.clone(max_line_length=0)
 
-    message.set_content(body_text)
-    if body_html:
-        message.add_alternative(body_html, subtype="html")
+    msg = MIMEMultipart("alternative", policy=custom_policy)
+    msg["From"] = f"Support Team <{settings.SMTP_SENDER}>"
+    msg["To"] = to
+    msg["Subject"] = subject
+
+    # Добавляем дату в формате RFC 2822
+    msg["Date"] = email.utils.formatdate(localtime=True)
+
+    # Генерируем уникальный Message-ID
+    msg_id = f"<{uuid.uuid4()}@lumiring.com>"
+    msg["Message-ID"] = msg_id
+
+    # Прямая установка заголовков без кодирования
+    if in_reply_to:
+        irt_id = _ensure_brackets(in_reply_to)
+        msg["In-Reply-To"] = irt_id
+
+    if references:
+        if isinstance(references, list):
+            refs = " ".join([_ensure_brackets(ref) for ref in references if ref])
+        else:
+            refs = _ensure_brackets(references)
+        msg["References"] = refs
+
+    # Логируем, что реально уходит в заголовках
+    logger.info(
+        f"DEBUG: Final headers - In-Reply-To: {msg.get('In-Reply-To')}, References: {msg.get('References')}"
+    )
+
+    part1 = MIMEText(body_text, "plain", "utf-8")
+    part2 = MIMEText(body_html, "html", "utf-8")
+    msg.attach(part1)
+    msg.attach(part2)
 
     try:
         await aiosmtplib.send(
-            message,
+            msg,
             hostname=settings.SMTP_HOST,
             port=settings.SMTP_PORT,
             username=settings.SMTP_USER,
