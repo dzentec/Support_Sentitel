@@ -60,11 +60,19 @@ async def process_email(raw_email_bytes):
             await session.flush()
 
             # Отправка автоответа
-            subject = f"Your request has been received [Ticket #{ticket.id}]"
-            body = render_email_template(
+            subject = f"Your request has been received [Ticket #{ticket.zoho_id or ticket.id}]"
+            body_text = render_email_template(
                 "auto_reply.txt",
                 {
-                    "ticket_id": ticket.id,
+                    "ticket_id": ticket.zoho_id or ticket.id,
+                    "sender_name": ticket.sender_name,
+                    "subject": ticket.subject,
+                },
+            )
+            body_html = render_email_template(
+                "auto_reply.html",
+                {
+                    "ticket_id": ticket.zoho_id or ticket.id,
                     "sender_name": ticket.sender_name,
                     "subject": ticket.subject,
                 },
@@ -73,7 +81,8 @@ async def process_email(raw_email_bytes):
             await send_email(
                 ticket.sender_email,
                 subject,
-                body,
+                body_text,
+                body_html=body_html,
                 in_reply_to=email_data["message_id"],
                 references=email_data["thread_references"],
             )

@@ -73,10 +73,11 @@ async def list_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📥 Активные тикеты (ожидают оператора):"
     keyboard = []
     for t in tickets:
+        display_id = t.zoho_id or t.id
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    f"#{t.id} - {t.subject}", callback_data=f"show|{t.id}"
+                    f"#{display_id} - {t.subject}", callback_data=f"show|{t.id}"
                 )
             ]
         )
@@ -97,8 +98,9 @@ async def send_ticket_details(bot, chat_id, ticket):
     name = ticket.sender_name or "Unknown"
     subject = ticket.subject or "(no subject)"
     draft = ticket.ai_draft or "No draft available."
+    display_id = ticket.zoho_id or ticket.id
 
-    text = f"🎫 Тикет #{ticket.id}\nОт: {name}\nТема: {subject}\n\nЧерновик:\n{draft}"
+    text = f"🎫 Тикет #{display_id}\nОт: {name}\nТема: {subject}\n\nЧерновик:\n{draft}"
     await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
