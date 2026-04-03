@@ -66,6 +66,8 @@ async def retrieve(query_text: str) -> KBContext:
     log.info(
         "rag.retriever",
         found=len(chunks),
-        top_score=chunks[0].score if chunks else None,
+        top_score=chunks[0].score
+        if chunks
+        else (round(1.0 - distances[0], 3) if distances else None),
     )
     return KBContext(chunks=chunks, is_empty=len(chunks) == 0)

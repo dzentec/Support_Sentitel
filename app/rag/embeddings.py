@@ -3,7 +3,7 @@ import asyncio
 from app.config import settings
 from app.utils.logging import logger
 
-EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
+EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
 
 
 async def get_embedding(text: str, retries: int = 3) -> list[float]:
@@ -12,9 +12,10 @@ async def get_embedding(text: str, retries: int = 3) -> list[float]:
     Retries up to 3 times with exponential backoff for transient errors.
     """
     payload = {
-        "model": "models/text-embedding-004",
+        "model": "models/gemini-embedding-001",
         "content": {"parts": [{"text": text}]},
     }
+
     headers = {"X-goog-api-key": settings.GEMINI_API_KEY}
 
     async with httpx.AsyncClient(timeout=15.0) as client:
