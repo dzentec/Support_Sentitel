@@ -17,8 +17,14 @@ services:
       - SMTP_PASS=${SMTP_PASS}
       - WEBHOOK_URL=${WEBHOOK_URL}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - RAG_TOP_K=${RAG_TOP_K:-5}
+      - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.75}
+      - RAG_CHUNK_SIZE=${RAG_CHUNK_SIZE:-500}
+      - RAG_CHUNK_OVERLAP=${RAG_CHUNK_OVERLAP:-50}
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./templates:/app/templates
+      - ./knowledge_base:/app/knowledge_base
     restart: unless-stopped

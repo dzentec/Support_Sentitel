@@ -1,0 +1,4082 @@
+diff --git a/app/api/__init__.py b/app/api/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/api/admin.py b/app/api/admin.py
+new file mode 100644
+index 0000000..b691ee5
+--- /dev/null
++++ b/app/api/admin.py
+@@ -0,0 +1,56 @@
++from fastapi import APIRouter, Depends, HTTPException
++from fastapi.security import APIKeyHeader
++from app.rag.indexer import index_all_documents, get_chroma_collection
++from app.config import settings
++import asyncio
++
++router = APIRouter(prefix="/admin/rag", tags=["admin"])
++api_key_header = APIKeyHeader(name="X-Admin-Key")
++
++
++async def verify_admin_key(key: str = Depends(api_key_header)):
++    # CRITICAL: Prevent access if key is empty or whitespace
++    if not settings.ADMIN_API_KEY or not settings.ADMIN_API_KEY.strip():
++        raise HTTPException(
++            status_code=403,
++            detail="Admin API is disabled. Configure ADMIN_API_KEY in .env",
++        )
++    if key != settings.ADMIN_API_KEY:
++        raise HTTPException(status_code=403, detail="Forbidden")
++
++
++@router.post("/reindex", dependencies=[Depends(verify_admin_key)])
++async def reindex():
++    """Reindex all documents without restarting."""
++    stats = await index_all_documents()
++    return {"status": "ok", "stats": stats}
++
++
++@router.get("/stats", dependencies=[Depends(verify_admin_key)])
++async def rag_stats():
++    """Index statistics."""
++    try:
++        collection = await asyncio.to_thread(get_chroma_collection)
++        count = await asyncio.to_thread(collection.count)
++
++        # Optimized retrieval of unique files
++        # For larger collections, this would be slow as it pulls all metadata.
++        # We limit the fields to just 'source_file' if supported.
++        result = await asyncio.to_thread(collection.get, include=["metadatas"])
++
++        files = {}
++        if result["metadatas"]:
++            for meta in result["metadatas"]:
++                fname = meta.get("source_file", "")
++                if fname:
++                    files[fname] = files.get(fname, 0) + 1
++
++        return {
++            "total_chunks": count,
++            "documents": [{"file": k, "chunks": v} for k, v in files.items()],
++            "warning": "Statistics based on current in-memory metadata scan."
++            if count > 5000
++            else None,
++        }
++    except Exception as e:
++        raise HTTPException(status_code=500, detail=str(e))
+diff --git a/app/config.py b/app/config.py
+index a64ceb2..a2badaa 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -37,5 +37,12 @@ class Settings:
+         if s.strip()
+     ]
+ 
++    # RAG Settings
++    RAG_TOP_K = int(os.getenv("RAG_TOP_K", 5))
++    RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", 0.75))
++    RAG_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", 500))
++    RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", 50))
++    ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
++
+ 
+ settings = Settings()
+diff --git a/app/main.py b/app/main.py
+index beaf6a3..1d7d1b3 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -9,6 +9,8 @@ from app.services.imap import poll_imap
+ from app.tasks.ticket_tasks import check_reminders, check_auto_close
+ from app.config import settings
+ from app.scheduler import scheduler
++from app.rag.indexer import index_all_documents
++from app.api.admin import router as admin_router
+ 
+ 
+ @asynccontextmanager
+@@ -17,6 +19,14 @@ async def lifespan(app: FastAPI):
+     await init_db()
+     start_scheduler()
+ 
++    # RAG Indexing
++    logger.info("RAG: Starting knowledge base indexing...")
++    try:
++        stats = await index_all_documents()
++        logger.info(f"RAG: Indexing complete. Stats: {stats}")
++    except Exception as e:
++        logger.error(f"RAG: Indexing failed: {e}", exc_info=True)
++
+     # Регистрация задач
+     scheduler.add_job(
+         poll_imap,
+@@ -65,6 +75,7 @@ async def lifespan(app: FastAPI):
+ 
+ 
+ app = FastAPI(lifespan=lifespan)
++app.include_router(admin_router)
+ 
+ 
+ @app.get("/")
+diff --git a/app/rag/__init__.py b/app/rag/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/rag/chunker.py b/app/rag/chunker.py
+new file mode 100644
+index 0000000..63365ab
+--- /dev/null
++++ b/app/rag/chunker.py
+@@ -0,0 +1,66 @@
++import re
++from typing import List
++from app.rag.schemas import TextChunk
++
++
++def chunk_text(
++    text: str,
++    source_file: str,
++    page: int,
++    document_hash: str,
++    chunk_size: int = 500,  # in tokens (approx, 1 token ≈ 4 chars)
++    overlap: int = 50,
++) -> List[TextChunk]:
++    """
++    Splits page text into overlapping chunks.
++    """
++    char_size = chunk_size * 4  # rough conversion tokens → chars
++    char_overlap = overlap * 4
++
++    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
++    sentences = []
++    for para in paragraphs:
++        # Split paragraph into sentences
++        parts = re.split(r"(?<=[.!?])\s+", para)
++        sentences.extend(parts)
++
++    chunks: List[TextChunk] = []
++    current = ""
++    chunk_idx = 0
++
++    for sentence in sentences:
++        if len(current) + len(sentence) <= char_size:
++            current += (" " if current else "") + sentence
++        else:
++            if len(current) >= 50:
++                chunks.append(
++                    TextChunk(
++                        chunk_id=f"{source_file}::{page}::{chunk_idx}",
++                        text=current.strip(),
++                        source_file=source_file,
++                        page=page,
++                        chunk_index=chunk_idx,
++                        document_hash=document_hash,
++                    )
++                )
++                chunk_idx += 1
++            # Overlap: take last char_overlap chars of previous chunk
++            overlap_text = (
++                current[-char_overlap:] if len(current) > char_overlap else current
++            )
++            current = overlap_text + " " + sentence
++
++    # Last chunk
++    if len(current) >= 50:
++        chunks.append(
++            TextChunk(
++                chunk_id=f"{source_file}::{page}::{chunk_idx}",
++                text=current.strip(),
++                source_file=source_file,
++                page=page,
++                chunk_index=chunk_idx,
++                document_hash=document_hash,
++            )
++        )
++
++    return chunks
+diff --git a/app/rag/embeddings.py b/app/rag/embeddings.py
+new file mode 100644
+index 0000000..2bc0f6c
+--- /dev/null
++++ b/app/rag/embeddings.py
+@@ -0,0 +1,81 @@
++import httpx
++import asyncio
++from app.config import settings
++from app.utils.logging import logger
++
++EMBEDDING_URL = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent"
++
++
++async def get_embedding(text: str, retries: int = 3) -> list[float]:
++    """
++    Get text embedding via Google Embedding API.
++    Retries up to 3 times with exponential backoff for transient errors.
++    """
++    payload = {
++        "model": "models/text-embedding-004",
++        "content": {"parts": [{"text": text}]},
++    }
++    headers = {"X-goog-api-key": settings.GEMINI_API_KEY}
++
++    async with httpx.AsyncClient(timeout=15.0) as client:
++        for attempt in range(retries):
++            try:
++                resp = await client.post(EMBEDDING_URL, json=payload, headers=headers)
++
++                # If hit rate limit (429), wait longer
++                if resp.status_code == 429:
++                    wait = (2**attempt) + 1
++                    logger.warning(
++                        f"Embedding API rate limited (429). Retrying in {wait}s..."
++                    )
++                    await asyncio.sleep(wait)
++                    continue
++
++                resp.raise_for_status()
++                return resp.json()["embedding"]["values"]
++
++            except httpx.HTTPStatusError as e:
++                # Don't retry on 4xx errors (except 429)
++                if 400 <= e.response.status_code < 500:
++                    logger.error(
++                        f"Embedding API non-retryable error: {e.response.text}"
++                    )
++                    raise EmbeddingAPIError(f"API Error: {e.response.status_code}")
++                raise
++            except Exception as e:
++                if attempt == retries - 1:
++                    raise EmbeddingAPIError(
++                        f"Embedding API unavailable after {retries} attempts: {e}"
++                    )
++                await asyncio.sleep(2**attempt)
++
++
++async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
++    """
++    Fetch embeddings concurrently in small batches to respect rate limits
++    while maximizing speed.
++    """
++    # Small chunks to avoid overwhelming the API
++    chunk_size = 5
++    all_embeddings = []
++
++    for i in range(0, len(texts), chunk_size):
++        batch = texts[i : i + chunk_size]
++        tasks = [get_embedding(text) for text in batch]
++        results = await asyncio.gather(*tasks, return_exceptions=True)
++
++        for res in results:
++            if isinstance(res, Exception):
++                logger.error(f"Failed to get embedding for chunk: {res}")
++                # We can't easily skip because index order matters.
++                # Re-raising for now as indexer handles stats.
++                raise res
++            all_embeddings.append(res)
++
++        await asyncio.sleep(0.5)  # Throttle between small batches
++
++    return all_embeddings
++
++
++class EmbeddingAPIError(Exception):
++    pass
+diff --git a/app/rag/indexer.py b/app/rag/indexer.py
+new file mode 100644
+index 0000000..5942672
+--- /dev/null
++++ b/app/rag/indexer.py
+@@ -0,0 +1,177 @@
++import hashlib
++import fitz  # pymupdf
++from pathlib import Path
++import chromadb
++import structlog
++import os
++import asyncio
++
++from app.rag.chunker import chunk_text
++from app.rag.embeddings import get_embeddings_batch, EmbeddingAPIError
++from app.rag.schemas import TextChunk
++from app.config import settings
++
++log = structlog.get_logger()
++
++# Use absolute paths resolved from the file's parent to the project root
++PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
++KB_DIR = PROJECT_ROOT / "knowledge_base"
++CHROMA_DIR = PROJECT_ROOT / "data" / "chroma"
++COLLECTION_NAME = "knowledge_base"
++
++
++def get_chroma_collection() -> chromadb.Collection:
++    """Get (or create) ChromaDB collection."""
++    if not CHROMA_DIR.exists():
++        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
++
++    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
++    return client.get_or_create_collection(
++        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
++    )
++
++
++def _file_hash(path: Path) -> str:
++    """SHA-256 file hash for incremental indexing."""
++    h = hashlib.sha256()
++    h.update(path.read_bytes())
++    return f"sha256:{h.hexdigest()[:16]}"
++
++
++def _get_indexed_hashes(collection: chromadb.Collection) -> dict[str, str]:
++    """
++    Returns {source_file: document_hash} for all indexed files.
++    Optimized: only fetch unique file hashes.
++    """
++    # Note: ChromaDB doesn't have a direct 'unique' query.
++    # For small KB (up to thousands of chunks), getting metadatas is okay.
++    # For very large KB, this would need a separate SQLite tracking table.
++    result = collection.get(include=["metadatas"])
++    hashes: dict[str, str] = {}
++    if result["metadatas"]:
++        for meta in result["metadatas"]:
++            fname = meta.get("source_file", "")
++            dhash = meta.get("document_hash", "")
++            if fname and dhash:
++                hashes[fname] = dhash
++    return hashes
++
++
++def _delete_file_chunks(collection: chromadb.Collection, source_file: str) -> None:
++    """Delete all chunks of a file from collection."""
++    collection.delete(where={"source_file": source_file})
++
++
++async def index_all_documents() -> dict:
++    """
++    Main indexing function. Runs at startup.
++    """
++    # Ensure KB_DIR exists
++    if not KB_DIR.exists():
++        await asyncio.to_thread(KB_DIR.mkdir, parents=True, exist_ok=True)
++
++    collection = await asyncio.to_thread(get_chroma_collection)
++    indexed_hashes = await asyncio.to_thread(_get_indexed_hashes, collection)
++
++    pdf_files = list(KB_DIR.glob("*.pdf"))
++    if not pdf_files:
++        log.warning(
++            "rag.indexer",
++            message="knowledge_base folder is empty, RAG context will be empty",
++        )
++        return {"indexed": 0, "skipped": 0, "errors": []}
++
++    stats = {"indexed": 0, "skipped": 0, "errors": []}
++
++    # Delete chunks of files that no longer exist
++    existing_names = {f.name for f in pdf_files}
++    for fname in list(indexed_hashes.keys()):
++        if fname not in existing_names:
++            await asyncio.to_thread(_delete_file_chunks, collection, fname)
++            log.info("rag.indexer", action="deleted_stale", file=fname)
++
++    for pdf_path in pdf_files:
++        fname = pdf_path.name
++        file_hash = await asyncio.to_thread(_file_hash, pdf_path)
++
++        # Skip if hash hasn't changed
++        if indexed_hashes.get(fname) == file_hash:
++            log.info("rag.indexer", action="skipped_unchanged", file=fname)
++            stats["skipped"] += 1
++            continue
++
++        # If file changed, delete old chunks first
++        if fname in indexed_hashes:
++            await asyncio.to_thread(_delete_file_chunks, collection, fname)
++
++        try:
++            chunk_count = await _index_single_pdf(collection, pdf_path, file_hash)
++            log.info("rag.indexer", action="indexed", file=fname, chunks=chunk_count)
++            stats["indexed"] += chunk_count
++        except EmbeddingAPIError as e:
++            log.error("rag.indexer", action="embedding_error", file=fname, error=str(e))
++            stats["errors"].append({"file": fname, "error": str(e)})
++        except Exception as e:
++            log.error("rag.indexer", action="parse_error", file=fname, error=str(e))
++            stats["errors"].append({"file": fname, "error": str(e)})
++
++    return stats
++
++
++async def _index_single_pdf(
++    collection: chromadb.Collection,
++    pdf_path: Path,
++    file_hash: str,
++) -> int:
++    """
++    Parses PDF, chunks text, gets embeddings, and saves to ChromaDB.
++    """
++
++    def parse_pdf():
++        chunks_out: list[TextChunk] = []
++        doc = fitz.open(str(pdf_path))
++        for page_num, page in enumerate(doc, start=1):
++            text = page.get_text("text").strip()
++            if not text:
++                continue
++            p_chunks = chunk_text(
++                text=text,
++                source_file=pdf_path.name,
++                page=page_num,
++                document_hash=file_hash,
++                chunk_size=settings.RAG_CHUNK_SIZE,
++                overlap=settings.RAG_CHUNK_OVERLAP,
++            )
++            chunks_out.extend(p_chunks)
++        doc.close()
++        return chunks_out
++
++    all_chunks = await asyncio.to_thread(parse_pdf)
++
++    if not all_chunks:
++        return 0
++
++    # Batch get embeddings (this is already async)
++    texts = [c.text for c in all_chunks]
++    embeddings = await get_embeddings_batch(texts)
++
++    # Upsert to ChromaDB (sync operation)
++    def upsert_to_chroma():
++        collection.upsert(
++            ids=[c.chunk_id for c in all_chunks],
++            embeddings=embeddings,
++            documents=texts,
++            metadatas=[
++                {
++                    "source_file": c.source_file,
++                    "page": c.page,
++                    "chunk_index": c.chunk_index,
++                    "document_hash": c.document_hash,
++                }
++                for c in all_chunks
++            ],
++        )
++
++    await asyncio.to_thread(upsert_to_chroma)
++
++    return len(all_chunks)
+diff --git a/app/rag/retriever.py b/app/rag/retriever.py
+new file mode 100644
+index 0000000..51358e6
+--- /dev/null
++++ b/app/rag/retriever.py
+@@ -0,0 +1,71 @@
++import structlog
++import chromadb
++import asyncio
++
++from app.rag.embeddings import get_embedding, EmbeddingAPIError
++from app.rag.schemas import KBContext, RetrievedChunk
++from app.rag.indexer import get_chroma_collection
++from app.config import settings
++
++log = structlog.get_logger()
++
++
++async def retrieve(query_text: str) -> KBContext:
++    """
++    Find relevant chunks for the query text.
++    """
++    try:
++        query_embedding = await get_embedding(query_text)
++    except EmbeddingAPIError as e:
++        log.warning(
++            "rag.retriever",
++            message="Embedding API unavailable, skipping RAG",
++            error=str(e),
++        )
++        return KBContext(chunks=[], is_empty=True)
++
++    try:
++        collection = await asyncio.to_thread(get_chroma_collection)
++        results = await asyncio.to_thread(
++            collection.query,
++            query_embeddings=[query_embedding],
++            n_results=settings.RAG_TOP_K,
++            include=["documents", "metadatas", "distances"],
++        )
++    except Exception as e:
++        log.error("rag.retriever", message="ChromaDB query error", error=str(e))
++        return KBContext(chunks=[], is_empty=True)
++
++    chunks: list[RetrievedChunk] = []
++    if not results["documents"] or not results["documents"][0]:
++        return KBContext(chunks=[], is_empty=True)
++
++    documents = results["documents"][0]
++    metadatas = results["metadatas"][0]
++    distances = results["distances"][0]
++
++    for doc, meta, dist in zip(documents, metadatas, distances):
++        # ChromaDB cosine distance is 1 - similarity.
++        # dist = 0.0 (identical) -> score = 1.0
++        # dist = 1.0 (orthogonal) -> score = 0.0
++        # dist = 2.0 (opposite) -> score = -1.0
++        score = 1.0 - dist
++
++        if score < settings.RAG_MIN_SCORE:
++            continue
++
++        chunks.append(
++            RetrievedChunk(
++                text=doc,
++                source_file=meta.get("source_file", "unknown"),
++                page=meta.get("page", 0),
++                score=round(score, 3),
++            )
++        )
++
++    log.info(
++        "rag.retriever",
++        found=len(chunks),
++        top_score=chunks[0].score if chunks else None,
++    )
++    return KBContext(chunks=chunks, is_empty=len(chunks) == 0)
+diff --git a/app/rag/schemas.py b/app/rag/schemas.py
+new file mode 100644
+index 0000000..0b4593f
+--- /dev/null
++++ b/app/rag/schemas.py
+@@ -0,0 +1,44 @@
++from dataclasses import dataclass
++from typing import List
++
++
++@dataclass
++class TextChunk:
++    """A single chunk of text from a PDF."""
++
++    chunk_id: str  # "filename::page::chunk_index"
++    text: str
++    source_file: str
++    page: int
++    chunk_index: int
++    document_hash: str
++
++
++@dataclass
++class RetrievedChunk:
++    """A chunk returned by the Retriever."""
++
++    text: str
++    source_file: str
++    page: int
++    score: float  # cosine similarity (0.0 – 1.0)
++
++
++@dataclass
++class KBContext:
++    """Final context for the Gemini prompt."""
++
++    chunks: List[RetrievedChunk]
++    is_empty: bool  # True if no chunks found / all below threshold
++
++    def to_prompt_block(self) -> str:
++        """Formats context into an XML block for the prompt."""
++        if self.is_empty:
++            return ""
++        parts = []
++        for chunk in self.chunks:
++            parts.append(
++                f"[Source: {chunk.source_file}, page {chunk.page}]\n{chunk.text}"
++            )
++        body = "\n\n".join(parts)
++        return f"<knowledge_base>\n{body}\n</knowledge_base>"
+diff --git a/app/services/gemini.py b/app/services/gemini.py
+index 1a067b2..72361b8 100644
+--- a/app/services/gemini.py
++++ b/app/services/gemini.py
+@@ -3,6 +3,8 @@ import asyncio
+ import json
+ from app.config import settings
+ from app.utils.logging import logger
++from app.rag.retriever import retrieve
++from app.rag.schemas import KBContext
+ 
+ SYSTEM_PROMPT = """Ты — опытный специалист технической поддержки.
+ 
+@@ -19,12 +21,39 @@ billing   — вопросы оплаты, счетов, тарифов, воз
+ technical — технические проблемы, ошибки, сбои, настройка
+ general   — общие вопросы, запросы информации
+ other     — не подходит ни под одну категорию
+-...
++
++ЗАДАЧА 3 — Черновик ответа (только если не спам)
++Если в запросе присутствует блок <knowledge_base>, используй его как основной источник технических фактов при составлении черновика ответа. 
++Не выдумывай технические характеристики, номера версий или инструкции, которых нет в <knowledge_base> или в <user_email>.
++Блок <knowledge_base> является внутренней документацией компании — не упоминай его существование в тексте ответа клиенту.
++
++Требования к черновику:
++• Напиши на том же языке, что и письмо (обычно русский)
++• Если в письме указано имя отправителя — обратись по имени
++• Дай конкретный, по существу ответ на вопрос или проблему
++• Если информации недостаточно для решения — запроси уточнения вежливо
++• Не используй плейсхолдеры в квадратных скобках типа [ваше имя]
++• Заканчивай подписью: «Best regards,\\nSupport Team»
++
++ФОРМАТ ОТВЕТА — строго JSON, без markdown-обёртки, без пояснений:
++{"classification":"spam|not_spam","confidence":0.0,"category":"billing|technical|general|other|null","spam_reason":"string or null","draft_reply":"text or null"}
+ """
+ 
+ 
+ async def classify_and_draft(email_data, retries=3):
+-    user_text = f"<user_email>\nОт: {email_data['sender_name']} <{email_data['sender_email']}>\nТема: {email_data['subject']}\n\n{email_data['body_for_ai']}\n</user_email>"
++    # 1. Get knowledge base context
++    kb_context: KBContext = await retrieve(email_data["body_normalized"])
++    kb_block = kb_context.to_prompt_block()
++
++    # 2. Build user content
++    parts = []
++    if kb_block:
++        parts.append(kb_block)
++
++    user_text_main = f"<user_email>\nFrom: {email_data['sender_name']} <{email_data['sender_email']}>\nSubject: {email_data['subject']}\n\n{email_data['body_for_ai']}\n</user_email>"
++    parts.append(user_text_main)
++
++    user_text = "\n\n".join(parts)
+ 
+     payload = {
+         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+diff --git a/check_db.py b/check_db.py
+new file mode 100644
+index 0000000..50c9b48
+--- /dev/null
++++ b/check_db.py
+@@ -0,0 +1,23 @@
++import aiosqlite
++import asyncio
++
++
++async def check_db():
++    try:
++        async with aiosqlite.connect("data/support.db") as db:
++            cursor = await db.execute("SELECT count(*) FROM tickets")
++            count = await cursor.fetchone()
++            print(f"Total tickets: {count[0]}")
++
++            cursor = await db.execute(
++                "SELECT id, subject, sender_email FROM tickets LIMIT 5"
++            )
++            rows = await cursor.fetchall()
++            for row in rows:
++                print(f" - #{row[0]}: {row[1]} from {row[2]}")
++    except Exception as e:
++        print(f"Error: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(check_db())
+diff --git a/check_db_detailed.py b/check_db_detailed.py
+new file mode 100644
+index 0000000..3456e6d
+--- /dev/null
++++ b/check_db_detailed.py
+@@ -0,0 +1,19 @@
++import asyncio
++import aiosqlite
++
++
++async def debug_tickets():
++    async with aiosqlite.connect("data/support.db") as db:
++        cursor = await db.execute(
++            "SELECT id, message_id, status, sender_email, subject FROM tickets ORDER BY id DESC"
++        )
++        rows = await cursor.fetchall()
++        print("--- ВСЕ ТИКЕТЫ В БД ---")
++        for row in rows:
++            print(
++                f"ID: {row[0]}, Status: {row[2]}, Sender: {row[3]}, Subject: {row[4]}"
++            )
++
++
++if __name__ == "__main__":
++    asyncio.run(debug_tickets())
+diff --git a/check_full_db.py b/check_full_db.py
+new file mode 100644
+index 0000000..841ad4e
+--- /dev/null
++++ b/check_full_db.py
+@@ -0,0 +1,17 @@
++import asyncio
++import aiosqlite
++
++
++async def debug_tickets():
++    async with aiosqlite.connect("data/support.db") as db:
++        cursor = await db.execute(
++            "SELECT id, status, subject FROM tickets ORDER BY id DESC LIMIT 10"
++        )
++        rows = await cursor.fetchall()
++        print("Последние тикеты в БД:")
++        for row in rows:
++            print(f"ID: {row[0]}, Status: {row[1]}, Subject: {row[2]}")
++
++
++if __name__ == "__main__":
++    asyncio.run(debug_tickets())
+diff --git a/check_gemini_models.py b/check_gemini_models.py
+new file mode 100644
+index 0000000..d02d98e
+--- /dev/null
++++ b/check_gemini_models.py
+@@ -0,0 +1,25 @@
++import httpx
++from app.config import settings
++import asyncio
++
++
++async def list_models():
++    # URL для листинга моделей
++    url = f"https://generativelanguage.googleapis.com/v1/models?key={settings.GEMINI_API_KEY}"
++    try:
++        async with httpx.AsyncClient() as client:
++            resp = await client.get(url)
++            if resp.status_code == 200:
++                models = resp.json()
++                print("Доступные модели:")
++                # Выводим названия моделей
++                for model in models.get("models", []):
++                    print(f"- {model['name']}")
++            else:
++                print(f"Ошибка {resp.status_code}: {resp.text}")
++    except Exception as e:
++        print(f"Ошибка запроса: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(list_models())
+diff --git a/check_imap_read.py b/check_imap_read.py
+new file mode 100644
+index 0000000..d93d919
+--- /dev/null
++++ b/check_imap_read.py
+@@ -0,0 +1,17 @@
++import asyncio
++from app.services.imap import poll_imap
++from app.utils.logging import setup_logging
++
++
++async def main():
++    setup_logging()
++    print("Запуск polling IMAP...")
++    try:
++        await poll_imap()
++        print("Polling завершен.")
++    except Exception as e:
++        print(f"Ошибка при polling IMAP: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(main())
+diff --git a/check_spam_list.py b/check_spam_list.py
+new file mode 100644
+index 0000000..560c431
+--- /dev/null
++++ b/check_spam_list.py
+@@ -0,0 +1,15 @@
++import asyncio
++import aiosqlite
++
++
++async def check_spam():
++    async with aiosqlite.connect("data/support.db") as db:
++        cursor = await db.execute("SELECT * FROM spam_senders")
++        rows = await cursor.fetchall()
++        print("--- БЛОК-ЛИСТ (spam_senders) ---")
++        for row in rows:
++            print(f"Email: {row[0]}, Reason: {row[2]}, Added: {row[1]}")
++
++
++if __name__ == "__main__":
++    asyncio.run(check_spam())
+diff --git a/clear_all_db.py b/clear_all_db.py
+new file mode 100644
+index 0000000..cf84f04
+--- /dev/null
++++ b/clear_all_db.py
+@@ -0,0 +1,19 @@
++import asyncio
++import aiosqlite
++
++
++async def clear_all_data():
++    try:
++        async with aiosqlite.connect("data/support.db") as db:
++            await db.execute("DELETE FROM tickets")
++            await db.execute("DELETE FROM ticket_events")
++            await db.execute("DELETE FROM pending_edits")
++            await db.execute("DELETE FROM spam_senders")
++            await db.commit()
++            print("Database tables cleared successfully.")
++    except Exception as e:
++        print(f"Error clearing database: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(clear_all_data())
+diff --git a/clear_spam.py b/clear_spam.py
+new file mode 100644
+index 0000000..30c0fb4
+--- /dev/null
++++ b/clear_spam.py
+@@ -0,0 +1,13 @@
++import asyncio
++import aiosqlite
++
++
++async def clear_spam():
++    async with aiosqlite.connect("data/support.db") as db:
++        await db.execute("DELETE FROM spam_senders")
++        await db.commit()
++        print("Spam list cleared.")
++
++
++if __name__ == "__main__":
++    asyncio.run(clear_spam())
+diff --git a/debug_headers.py b/debug_headers.py
+new file mode 100644
+index 0000000..2f9cc33
+--- /dev/null
++++ b/debug_headers.py
+@@ -0,0 +1,31 @@
++import asyncio
++import aioimaplib
++from app.config import settings
++import mailparser
++
++
++async def debug_first_email():
++    print(f"Подключение к {settings.IMAP_HOST}...")
++    client = aioimaplib.IMAP4_SSL(settings.IMAP_HOST, settings.IMAP_PORT)
++    await client.wait_hello_from_server()
++    await client.login(settings.IMAP_USER, settings.IMAP_PASS)
++    await client.select("INBOX")
++
++    status, data = await client.search("UNSEEN")
++    if status == "OK":
++        msg_ids = data[0].split()
++        if msg_ids:
++            msg_id = msg_ids[0]
++            print(f"Получение заголовков письма {msg_id}...")
++            status, msg_data = await client.fetch(msg_id, "(RFC822)")
++            print(f"Status: {status}")
++            print(f"Data content: {msg_data}")
++
++        else:
++            print("Нет новых писем для отладки.")
++
++    await client.logout()
++
++
++if __name__ == "__main__":
++    asyncio.run(debug_first_email())
+diff --git a/debug_imap_all.py b/debug_imap_all.py
+new file mode 100644
+index 0000000..880dfda
+--- /dev/null
++++ b/debug_imap_all.py
+@@ -0,0 +1,52 @@
++import asyncio
++import aioimaplib
++from app.config import settings
++import logging
++
++# Настройка простого логгера
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger(__name__)
++
++
++async def debug_imap():
++    print(f"Connecting to {settings.IMAP_HOST}...")
++    try:
++        client = aioimaplib.IMAP4_SSL(settings.IMAP_HOST, settings.IMAP_PORT)
++        await client.wait_hello_from_server()
++        await client.login(settings.IMAP_USER, settings.IMAP_PASS)
++
++        # Список папок
++        print("Список папок:")
++        status, data = await client.list("", "*")
++        for folder in data:
++            print(f" - {folder}")
++
++        await client.select("INBOX")
++
++        # Поиск всех сообщений, не только UNSEEN
++        print("Поиск всех сообщений (ALL)...")
++        status, data = await client.search("ALL")
++        if status == "OK":
++            msg_ids = data[0].split()
++            print(f"Найдено сообщений (ALL): {len(msg_ids)}")
++            if msg_ids:
++                print(f"Последний ID: {msg_ids[-1]}")
++        else:
++            print(f"Поиск ALL не удался: {status}")
++
++        # Поиск UNSEEN
++        print("Поиск непрочитанных (UNSEEN)...")
++        status, data = await client.search("UNSEEN")
++        if status == "OK":
++            msg_ids = data[0].split()
++            print(f"Найдено непрочитанных: {len(msg_ids)}")
++        else:
++            print(f"Поиск UNSEEN не удался: {status}")
++
++        await client.logout()
++    except Exception as e:
++        print(f"Ошибка IMAP: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(debug_imap())
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 1b5fe95..d977350 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -17,8 +17,14 @@ services:
+       - SMTP_PASS=${SMTP_PASS}
+       - WEBHOOK_URL=${WEBHOOK_URL}
+       - LOG_LEVEL=${LOG_LEVEL:-INFO}
++      - RAG_TOP_K=${RAG_TOP_K:-5}
++      - RAG_MIN_SCORE=${RAG_MIN_SCORE:-0.75}
++      - RAG_CHUNK_SIZE=${RAG_CHUNK_SIZE:-500}
++      - RAG_CHUNK_OVERLAP=${RAG_CHUNK_OVERLAP:-50}
++      - ADMIN_API_KEY=${ADMIN_API_KEY}
+     volumes:
+       - ./data:/app/data
+       - ./logs:/app/logs
+       - ./templates:/app/templates
++      - ./knowledge_base:/app/knowledge_base
+     restart: unless-stopped
+diff --git a/find_specific_email.py b/find_specific_email.py
+new file mode 100644
+index 0000000..cd9fe6b
+--- /dev/null
++++ b/find_specific_email.py
+@@ -0,0 +1,33 @@
++import asyncio
++import aioimaplib
++from app.config import settings
++
++
++async def find_email():
++    print(f"Connecting to {settings.IMAP_HOST}...")
++    try:
++        client = aioimaplib.IMAP4_SSL(settings.IMAP_HOST, settings.IMAP_PORT)
++        await client.wait_hello_from_server()
++        await client.login(settings.IMAP_USER, settings.IMAP_PASS)
++        await client.select("INBOX")
++
++        # Search for subject specifically
++        subject_to_find = "#3968 Problem with RFID Readers 102"
++        # IMAP search SUBJECT is case insensitive usually
++        status, data = await client.search(f'SUBJECT "{subject_to_find}"')
++
++        if status == "OK":
++            msg_ids = data[0].split()
++            print(f"Found {len(msg_ids)} messages with subject: '{subject_to_find}'")
++            for msg_id in msg_ids:
++                print(f" - Message ID on server: {msg_id.decode()}")
++        else:
++            print(f"Search failed with status: {status}")
++
++        await client.logout()
++    except Exception as e:
++        print(f"IMAP Error: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(find_email())
+diff --git a/knowledge_base/20250901_AIR_R_Manual_EN_V3.2.pdf b/knowledge_base/20250901_AIR_R_Manual_EN_V3.2.pdf
+new file mode 100644
+index 0000000..c84bd95
+--- /dev/null
++++ b/knowledge_base/20250901_AIR_R_Manual_EN_V3.2.pdf
+@@ -0,0 +1,668 @@
++2025-09-01  Fw.v. 1.135 Hw.v. RA-2R / REV.1.09  Federal
++V 3.2                                           Communications
++                                                Commissions
++
++MANUAL
++
++AIR-R
++
++AIR-R
++CONTENTS
++
++• Introduction                                              3
++
++• Device Specifications                                     4
++
++• Default Device Settings                                   4
++
++• Device Dimensions                                         5
++
++• Wire Designation                                          6
++
++• Installation Recommendations
++
++       ◦ Placement and Wiring                               7
++
++       ◦ Connecting Power to the Device                     7
++
++       ◦ Wiegand Connection                                 7
++
++       ◦ Connecting Open Supervised Device Protocol (OSDP)  7
++
++       ◦ Connecting Electric Locks                          7
++
++       ◦ Protection Against High Current Surges             7
++
++• Connection Diagram:
++
++       ◦ Wiegand Interface                                  8
++
++       ◦ OSDP Interface                                     9
++
++• Web Interfaces:
++
++       ◦ Login                                              11
++
++       ◦ Connecting to Device                               11
++
++       ◦ System                                             12
++
++       ◦ Network                                            13
++
++       ◦ Main                                               14
++
++       ◦ Maintenance                                        15
++
++• Hardware Reset & Indication description                   16
++
++• Glossary                                                  17
++
++• Fcc Caution                                               19
++
++• For Notes                                                 19
++
++AIR-R                                                       2
++    Introduction
++
++   This document provides detailed information on the structure of the device as well as the steps to
++install and connect it.
++
++   It also includes instructions for preventing or troubleshooting many common problems. This guide is
++for informational purposes only, and the actual product takes precedence in case of any discrepancies.
++
++   All instructions, software, and functionality are subject to change without prior notice. The latest
++version of the manual and additional documentation can be found on our website or by contacting
++customer support.
++
++   The user or installer is responsible for complying with local laws and privacy regulations when
++collecting personal data while using the product.
++
++    FCC Statement
++
++   Changes or modifications not expressly approved by the party responsible for compliance could void
++the user's authority to operate the equipment.
++
++   This equipment has been tested and found to comply with the limits for a Class B digital device,
++pursuant to Part 15 of the FCC Rules. These limits are designed to provide reasonable protection against
++harmful interference in a residential installation. This equipment generates uses and can radiate radio
++frequency energy and, if not installed and used in accordance with the instructions, may cause harmful
++interference to radio communications. However, there is no guarantee that interference will not occur in a
++particular installation. If this equipment does cause harmful interference to radio or television reception,
++which can be determined by turning the equipment off and on, the user is encouraged to try to correct the
++interference by one or more of the following measures:
++
++   -- Reorient or relocate the receiving antenna.
++   -- Increase the separation between the equipment and receiver.
++   -- Connect the equipment into an outlet on a circuit different from that to which the receiver is
++connected.
++   -- Consult the dealer or an experienced radio/TV technician for help
++   This device complies with part 15 of the FCC rules. Operation is subject to the following two conditions
++(1)this device may not cause harmful interference, and (2) this device must accept any interference
++received, including interference that may cause undesired operation.
++   This equipment complies with FCC radiation exposure limits set forth for an uncontrolled environment.
++This equipment should be installed and operated with minimum distance 20cm between the radiator &
++your body.
++
++AIR-R  3
++ Device Specifications                                 Light; MIFARE Classic mini/1K/4K; MIFARE
++                                                       Classic EV1 1K/4K; NFC Tag
++Voltage:                                           Support copy protection:
++• 12 or 24 VDC operation                           • MIFARE Classic mini/1K/4K
++• 0.13A @12 VDC, 0.065A @ 24 VDC current           Dimensions (D x H):
++                                                   • 2.36" x 0.67" (60 x 17 mm)
++    consumption                                    • 2.36" x 0.86" (60 x 22 mm) mounting ring
++Outputs*:                                          Mounting method:
++• One output (open collector) 0.5A @ 12 VDC        • Wall mount
++Inputs*:                                           Weight:
++• Two inputs (dry contact type) from 0 to 5 volts  • 1.59 oz (45 g)
++Communication interfaces:                          Operation temperature:
++• Wi-Fi 802.11 b/g/n 2.4 GHz                       • -22°F ~ 158°F (-30°C ~ 70°C)
++• Bluetooth® 5 (LE)                                Ingress protection rating:
++• Wiegand 26, 34, 48, 56 bit                       • IP 65
++• OSDP via RS-485
++RFID 125 kHz support:
++• EM Marine
++RFID 13.56 MHZ support:
++• MIFARE DESFire; MIFARE Plus; MIFARE Ultra
++
++    Default Device Settings                        RFID 13.56 MHz:
++                                                   • Enabled
++   Wi-Fi device name when searching:               Copy protection:
++   • AIR-R_(serial_number)                         • Disabled
++   Access point (AP) Wi-Fi IP address of the       Bluetooth:
++device:                                            • Enabled
++   • 192.168.4.1                                   AP Wi-Fi timer:
++   Wi-Fi password:                                 • 30 minutes
++   • None (factory default)                        Wiegand format 125 kHz:
++   Web page login:                                 • 26 bit
++   • admin                                         Wiegand format 13.56 MHZ:
++   Web page password:                              • 34 bit
++   • admin123
++   RFID 125 kHz:
++   • Enabled
++
++* When using OSDP with ICON and ICON-Pro Controllers. Coming soon!
++
++AIR-R                                                                                            4
++       Device Dimensions
++
++                                                           2.125"
++
++2.36"                                                              125, 65535
++
++                                                                                           3.375"
++
++0.67"                                     Front view         Standard RFID card size
++
++0.08"                                     Side view                   2.91”
++                                    Thin mounting ring
++0.2"                               Thick mounting ring                 1.15"
++
++                                    1.15"                  L                                                           4.72”
++
++1.61"                               1.61"                      Optional accessory
++
++                                 Mounting ring front view                                                           5
++
++     AIR-R
++Wire Designation
++
++                  Red     +VDC            Power/Lock
++                  Gray*   GND Lock*                  LED
++                  Black   GND
++                  Orange  Green LED               Inputs
++                  Brown   Red LED                 OSDP
++                  Pink*   DPS*                Wiegand
++                  Blue*   Exit Button*
++                  Yellow  RS-485 A+
++                  Purple  RS-485 B-
++                  Green   Data 0
++                  White   Data 1
++                  Black   GND
++
++                  Blue    Not applicable
++                  Gray    Not applicable
++                  Orange  Not applicable
++                  White   Not applicable
++
++• * Available when using OSDP when connected to the Controller as an expansion device.
++
++AIR-R                                                                                   6
++Installation Recommendations
++
++Placement and Wiring
++• The reader is designed for outdoor and indoor installation.
++• When placing the reader, it is necessary to avoid installation on metal surfaces, as it can reduce the
++
++    distance of access card reading, as well as the operation of the built-in Bluetooth and Wi-Fi module.
++Connecting Power to the Device
++• A power cable with a suitable cross-section is used to supply the current consumption of the connected
++
++    devices. Make sure to use two separate power supplies for the device and the actuators.
++Wiegand Connection
++• Connect the readers using the same Wiegand format and byte order to avoid differences in card code
++
++    reading and subsequent confusion in the system.
++• The Wiegand communication line length should be at most 328 ft (100 m). If the communication line is
++
++    longer than 16.4 ft (5 m), use a UTP Cat5e cable. The line must be at least 1.64 feet (0.5 m) away from
++    power cables.
++• Keep the reader power line wires as short as possible to avoid a significant voltage drop across them. After
++    laying the cables, ensure the power supply voltage to the reader is at least 12 VDC when the locks are on.
++Connecting Open Supervised Device Protocol (OSDP)
++• The OSDP uses an RS-485 interface that is designed for long-distance communications. It operates at up
++    to 3,280 ft (1,000 m) with good resistance to noise interference.
++• The OSDP communication line should be far from power cables and electric lights. A one-twisted pair,
++    shielded cable, 120 impedance, 24 AWG should be used as the OSDP communication line (if possible,
++    ground the shield at one end).
++Connecting Electric Locks
++• Connect devices via relays if galvanic isolation from the device is needed or if you need to control high-
++    voltage devices or devices with significant current consumption.
++• To ensure reliable system operations, it is best to use one power source for the controllers and a separate
++    one for the actuators.
++Protection Against High Current Surges
++• A protective diode protects the devices from reverse currents when triggering an electromagnetic or
++    electromechanical lock. A protective diode or varistor is installed near the lock parallel to the contacts.
++• THE DIODE IS CONNECTED IN REVERSE POLARITY.
++
++Diodes: (Connect in reverse polarity) SR5100, SF18, SF56, HER307, and similar.
++
++Varistors: (No polarity required)  5D330K, 7D330K, 10D470K, 10D390K, and similar.
++
++AIR-R                                                                              7
++Wiegand Interface
++
++Connection Diagram
++
++                        Red  White Brown/Brown
++                      Black  White-green/White-orange
++                     Brown   White-Blue
++                    Orange   Blue
++                      White  Green
++                     Green   Orange
++
++                                                      Cable length up to 165 feet
++
++                                                                                                       White Brown/Brown +VDC
++                                                                                             White-green/White-orange GND
++
++                                                                                                                   White-Blue Red Led
++                                                                                                                            Blue Green Led
++
++                                                                                                                          Green Data 1
++                                                                                                                        Orange Data 0
++
++                 Example of connection to the terminal blocks of ICON and ICON-Pro Сontrollers.
++
++To connect the reader to third-party controllers, please refer to the manufacturer's instructions.
++
++• The voltage level at the power supply and at the reader may differ depending on the cable length and
++    the resistance of the conductor.
++
++• The recommended voltage should be at least +10 VDC.
++• Use a multimeter in the VDC measurement mode to verify that the power supply voltage meets the
++
++    recommended requirements.
++
++AIR-R                                                  8
++                OSDP Interface
++
++                Connection Diagram
++
++         15.4W                                                        EMERG.IN                    Power
++                                                                                B                 Supply
++LAN PoE+                                                                        A
++           OSDP DOOR 3 DOOR 4 RELAY 1 RELAY 2 RELAY 3 RELAY 4 BUTTON                   Purple OSDP B
++                                                                          REX 3        Yellow OSDP A
++   NETWORK                                                                  GND         Black GND
++
++ICON-PRO ACCESS CONTROLLER                                              CONT. 3           Red +VDC
++                                                                          REX 4         Black GND
++                                                                            GND
++                                                                                                  Power
++                                                                        CONT. 4                   Supply
++                                                                              NC
++                                                                                C  Next
++                                                                              NO   Readers
++                                                                              NC
++                                                                                C                                                            9
++                                                                              NO
++                                                                              NC
++                                                                                C
++                                                                              NO
++                                                                              NC
++                                                                                C
++                                                                              NO
++
++WW.LUMIRING.COM
++
++AIR-R
++OSDP Interface                                       To the
++                                                     controller
++Connection Diagram
++                                                                    Power
++         BE SURE TO CONNECT THE GND OF THE                          Supply
++         CABLE FROM THE CONTROLLER TO THE
++Warning  GND OF THE AUXILIARY POWER SUPPLY!
++
++         DO NOT USE POWER SUPPLIES WITH
++         DIFFERENT VOLTAGE LEVELS!
++
++Warning  All branches from the primary data cable
++         should be kept as short as possible.
++         The length of taps from the primary data
++         cable should be at most 8 inches.
++
++Warning  Always route the main data cable away from  Purple OSDP B
++         power cables and sources of electrostatic   Yellow OSDP A
++         interference.                                Black GND
++
++         Terminal resistors ensure that the             Red +VDC
++         "open" end of the cable is matched           Black GND
++         to the rest of the line, eliminating
++         signal reflection.                                      Power
++                                                                 Supply
++
++Warning
++
++         The nominal resistance of the
++         resistors corresponds to the wave
++         impedance of the cable, and for
++         twisted pair cables is typically 100
++         to 120 ohms.
++
++         Install a 120 ohm terminating
++         resistor on the outermost reader if
++         the cable runs more than 150 feet.
++
++         See RS-485 interface specifications
++         for more information.
++
++AIR-R                                                                       10
++Login
++
++   Connecting to Device
++
++   Connecting to the built-in Wi-Fi access point (AP).
++   Step 1. Connect the device to a power source.
++   Step 2. Search for Wi-Fi and connect to the AIR-R_xxxxxxxxx network.
++   Step 3. In the address bar of your browser, enter the factory IP address (192.168.4.1) and press “Enter.” Wait
++for the start page to load.
++   Step 4. Enter the user name and password (if they have already been set) and press “Enter.” If the device is
++new or has been previously reset, enter login: admin, pass: admin123 and press “Enter.”
++   The browser will automatically redirect you to the System page.
++
++AIR-R  11
++System
++
++This System section displays information about the current settings and status of the device.
++
++   The Current Status subsection displays the:            • Network mask.
++   • Status of embedded readers 125kHz, 13.56             • Gateway
++                                                          • Domain Name Service (DNS).
++        MHz, and BLE 2.4 GHz.                             • Network port of the device.
++   • Status of the device connection to the router in     • Built-in Wi-Fi AP operation mode ("Always on" or
++
++        use.                                                   "Timed").
++   • Status of the built-in Wi-Fi access point.           In the Hardware Information subsection, you can
++   • OSDP connection status.                           see the:
++   • Level and quality of the device's connection to      • Device model name.
++                                                          • Device serial number.
++        the Wi-Fi router.                                 • Current firmware version.
++   • Power supply voltage value.                          • Current hardware version of the device.
++   The Network Information subsection displays            • Web version used by the device.
++the:                                                      • The application programming interface (API)
++   • Device’s IP address.
++   • Network mode - Manual or Dynamic Host                     version used by the device.
++
++        Configuration Protocol (DHCP).
++
++AIR-R                                                                                          12
++Network
++
++   In the Network section, you can set up an Internet connection via Wi-Fi or Ethernet, you can change
++the connection settings for the built-in Wi-Fi AP, and you can set its activity time.
++
++   The Network subsection provides the following           • In the Password field, enter the connection
++functions:                                                     password.
++
++   • Click on the SSID name field to search for            • ”Enable hidden mode” checkbox: hides the
++        available Wi-Fi networks and enter the                 AP's built-in network name when searching. To
++        password to connect.                                   connect to the device, you must know its
++                                                               name and enter it manually when connecting.
++   • Select DHCP for automatic network settings or
++        Manual to enter all network settings manually in   • In the "Wi-Fi Timer, min" field, enter a value
++        the available fields below, then click “Connect.”      from 1 to 60 minutes. If you enter 0, the
++                                                               access point will be on all the time.
++   The Wi-Fi AP subsection provides the following
++functions:                                                 • HTTP port: By default, the device uses port 80.
++
++   • In the Local Wi-Fi AP name field, enter the
++        device's network name.
++
++AIR-R                                                      13
++Main
++
++   Embedded features                                        • Check the “Enable copy protection” checkbox
++                                                                 to use the 13.56 MHz format ID verification
++   • Selecting RFID Readers makes the 125 kHz                    mode for authenticity.
++        and 13.56 MHz built-in reader antenna modules
++        active and configurable.                            • Enter the ID encryption password.
++
++   • Uncheck the “Enable” checkbox in the RFID              Note: The Copy Protection feature uses a
++        Reader 125 kHz settings section to disable the   unique password encryption method to encrypt
++        ability to read identifiers of this format.      private identifier memory areas. If the encryption
++                                                         password of the identifier and the reader match,
++   • Check the “Reverse byte order” checkbox to          then the reader will recognize the identifier. If there
++        change the code reading order for 125 kHz        is no password or it is different, the identifier is
++        identifiers.                                     ignored. Thus, all identifiers other than encrypted
++                                                         ones will be ignored. Copying an encrypted
++   • Uncheck the “Enable” checkbox in the RFID           identifier means that only part of its code from
++        Reader 13.56 MHz settings section to disable     open areas can be copied. At the same time,
++        the ability to read identifiers of this format.  closed areas are difficult or impossible to copy.
++
++   • Select the desired Output Format from the list of      Bluetooth reader
++        supported Wiegand formats.
++                                                            • Check the “Enable” checkbox in the Bluetooth
++   Note: The choice of Output Format is                          Reader section to enable the built-in Bluetooth
++determined according to the format used in the                   Low Energy (BLE) module. In the Name field,
++access control system and based on the type of                   you can give the device a name that will be
++identifiers. It is recommended to use the same                   visible when scanning available Bluetooth
++format on all readers within an access control                   connections.
++system. The default format for 13.56 MHz
++identifiers is Wiegand 34 bit.                              The Wiegand Settings subsection and OSDP
++                                                         functionality are under development and will be
++   • Check the “Reverse byte order” checkbox to          available soon. Keep an eye out for updates.
++        change the code reading order for 13.56 MHz
++        identifiers.
++
++AIR-R                                                    14
++Maintenance
++
++   The Firmware section displays the current           interruption during the update may cause a
++version of the unit's firmware.                        firmware update application error.
++
++   Note: It is recommended to upgrade the device          If this happens, disconnect power from the
++to the latest firmware version before use.             device for 10 seconds and reconnect.
++
++   Note: The device must be connected to the              Leave the unit switched on for 5 minutes
++Internet and close to a Wi-Fi router during the        without attempting to connect or log into the web
++update.                                                interface.
++
++   • To download a new firmware version, connect          The unit will automatically download the latest
++        to a network with Internet access in the       previously used firmware version and resume
++        Network section.                               operation.
++
++   • Click the “Check & Update” button and wait           The Restart/Reset subsection performs the
++        until the update process completes.            following actions:
++
++   • A modal window will prompt you to reboot the         • Restart - restarts the device.
++        device.
++                                                          • Full reset - resets all settings of the device to
++   • After restarting, verify that the device version          factory defaults.
++        has changed.
++                                                          The Security subsection is used to change the
++   Note: The update duration depends on the            password for logging into the interface of the
++Internet connection quality and firmware version       device:
++but usually takes a maximum of 5 minutes.
++                                                          • Enter the new login password and confirm it.
++   If the update takes more than 5 minutes,
++forcibly reboot the device by switching off the           • Apply the changes by clicking “Update.”
++power and trying the update again.
++                                                          The new password can be used the next time you
++   A power failure or network connection               log into the device interface.
++
++AIR-R                                                  15
++Hardware Reset
++
++                      Red +VDC
++                    Black GND
++
++                    Pink DPS
++
++                                                                 Warning
++
++                                                 Short-circuit
++                                               the white, green,
++                                                and pink wires.
++
++                    Green Data 0
++                    White Data 1
++
++                    Hardware reset procedure
++                    1. Turn off the power to the device.
++                    2. Disconnect the white, green, and pink wires from the external reader.
++                    3. Short-circuit the white, green, and pink wires.
++                    4. Apply power to the device.
++                    5. The device will flash yellow and emit seven short beeps, then turn green and emit
++
++                        three short beeps.
++                    6. Disconnect the white, green, and pink wires from each other.
++                    7. The device will light up yellow, beep three times, and then go into standby mode.
++                    8. The hardware reset procedure is complete, and the device is ready for use.
++
++Warning  • When performing a hardware reset, all data stored in the device memory and all related settings will be
++              deleted.
++
++         • This procedure cannot be undone.
++
++     Indication     Device status              Description
++                    Standby mode               Waiting state of the identifier
++LED color/behavior  Access granted             Indication color when a low voltage level appears
++Blue (solid)                                   on the orange wire.
++Green (solid)                                  Indication color when a low voltage level appears
++                                               on the brown wire.
++Red (solid)         Access denied              The device's Wi-Fi Access Point (AP) is activated.
++                                               Connected to the Web interface via the built-in
++Yellow (solid)      Waiting for confirmation   Wi-Fi AP
++Yellow (flashing)   Configuration via the Web  The device is performing a full system reset.
++                    interface is in progress
++Red/Buzzer          Full reset
++
++AIR-R                                          16
++ Glossary
++
++• +VDC - Positive voltage direct current.
++• Account ID - A unique identifier associated with an individual or entity's account, used for authentication
++
++      and access to services.
++• ACU - Access control unit. The device and its software that establishes the access mode and provides
++
++      reception and processing of information from readers, control of executive devices, display and logging of
++      information.
++• API - application programming interface.
++• BLE - Bluetooth Low Energy.
++• Block in - Function for the input activating "block out" with the event "blocked by operator." It is used for
++      turnstile control.
++• Block out - Output activated when "block In" is triggered.
++• Bluetooth - A short-range wireless communication technology that enables wireless data exchange
++      between digital devices.
++• BUZZ - Output for connecting the reader wire responsible for sound or light indication.
++• Cloud - A cloud-based platform or service provided to manage and monitor an access control system
++      over the Internet. Allows administrators to manage access rights, monitor events, and update system
++      settings using a web-based interface, providing the convenience and flexibility to manage the access
++      control system from anywhere there is an Internet connection.
++• Copy protection - A method used to prevent unauthorized copying or duplication of smart cards to
++      secure the access control system and prevent possible security breaches.
++• D0 - “Data 0." A bit line with the logical value "0."
++• D1 - "Data 1." A bit line with the logical value "1."
++• DHCP - Dynamic Host Configuration Protocol. A network protocol that allows network devices to
++      automatically obtain an IP address and other parameters necessary for operation in a Transmission
++• Control Protocol/Internet Protocol TCP/IP network. This protocol works on a "client-server" model.
++• DNS - Domain Name System is a computer-based distributed system for obtaining domain information. It
++      is most often used to obtain an IP address by host name (computer or device), to obtain routing
++      information, and to obtain serving nodes for protocols in a domain.
++• DPS - Door position sensor. A device that is used to monitor and determine the current status of a door,
++      such as whether the door is open or closed.
++• Electric latch - An electronically controlled door locking mechanism.
++• Emergency in - Input for emergency situations.
++• Encryption password - Key for data protection.
++• Ethernet network - A wired computer network technology that uses cables to connect devices for data
++      transmission and communication.
++• Exit/Entry/Open button - Logic input which, when activated, activates the corresponding output. Causes
++      an event depending on the attribute used.
++• Exit/Entry/Open out - Logical output that is activated when the corresponding input is triggered. Causes
++      an event depending on the attribute used.
++• External relay - Relay with potential-free dry contact for remote control of the power supply. The relay is
++      equipped with a dry contact, which is galvanically unconnected to the power supply circuit of the device.
++• GND - Electrical ground reference point.
++• HTTP - Hypertext Transfer Protocol. A fundamental protocol for transferring data, documents, and
++      resources over the Internet.
++• RFID Identifier 125 kHz - Radio-frequency identification at 125 kHz; short-range, low-frequency
++      technology with a typical range of 7 cm to 1 m.
++• RFID Identifier 13.56 MHZ - Radio-frequency identification at 13.56 MHz; high-frequency technology
++      with short to moderate range, around 10 cm.
++• Keypad - A physical input device with a set of buttons or keys, often used for manual data entry or
++      access control.
++
++AIR-R  17
++ Glossary
++
++• LED - Light emitting diode.
++• Loop sensor - A device that detects the presence or passage of traffic in a certain area by means of a
++
++      closed electrical loop. Used in barriers or gates.
++• Magnetic Lock - A locking mechanism that uses electromagnetic force to secure doors, gates, or access
++
++      points.
++• MQTT - Message Queuing Telemetry Transport. A server system that coordinates messages between
++
++      different clients. The broker is responsible, among other things, for receiving and filtering messages,
++      identifying the clients subscribed to each message, and sending messages to them.
++• NC - Normally closed. Configuration of a changeover contact that is closed in the default state and open
++      when activated.
++• NO - Normally open. A switch contact configuration that is open in its default state and closes when
++      activated.
++• No-touch button - A button or switch that can be activated without physical contact, often using
++      proximity or motion-sensing technology.
++• Open collector - A transistor switch configuration in which the collector is left unconnected or open,
++      typically used for signal grounding.
++• OSDP - Open Supervised Device Protocol. A secure communication protocol used in access control
++      systems for device-to-device data exchange.
++• Pass control - The process of regulating, monitoring, or granting permission for individuals to enter or exit
++      a secure area.
++• Power supply - A device or system that provides electrical energy to other devices, enabling them to
++      operate and function.
++• Radio 868/915 MHZ - A wireless communication system operating on the 868 MHz or 915 MHz
++      frequency bands.
++• Reader - A device that scans and interprets data from RFID or smart cards, often used for access control
++      or identification.
++• Revers byte order - A process of reordering the sequence of bytes in a data stream, often for
++      compatibility or data conversion.
++• REX - Request to exit. An access control device or button used to request to exit from a secured area.
++• RFID - Radio-frequency identification. A technology for wireless data transmission and identification using
++      electromagnetic tags and readers.
++• RS-485 - A standard for serial communication used in industrial and commercial applications, supporting
++      multiple devices over a shared network.
++• Strike lock - An electronic locking mechanism that releases a door's latch or bolt when electrically
++      activated, often used in access control systems.
++• Terminal block - A modular connector used for connecting and securing wires or cables in electrical and
++      electronic systems.
++• Topic - In the context of MQTT, a label or identifier for published messages, enabling subscribers to filter
++      and receive specific information.
++• Unblock in - An input or signal used to release a lock, barrier, or security device, allowing access to a
++      previously secured area.
++• Unblock out - An output or signal used to release a lock, barrier, or security device to allow exit or
++      opening.
++• Wiegand format - A data format used in access control systems, typically for transmitting data from card
++      readers to controllers.
++• Wiegand interface - A standard interface used in access control systems to communicate data between
++      card readers and access control panels.
++• Wi-Fi AP - Wireless access point. A device that allows wireless devices to connect to a network.
++• Wireless access control gateway - A device that manages and connects wireless access control
++      devices to a central system or network.
++
++AIR-R  18
++    FCC Caution
++
++   This device complies with part 15 of the FCC Rules. Operation is subject to the following two
++conditions: (1) This device may not cause harmful interference, and (2) this device must accept any
++interference received, including interference that may cause undesired operation.
++
++   Any Changes or modifications not expressly approved by the party responsible for compliance could
++void the user's authority to operate the equipment.
++
++   Note: This equipment has been tested and found to comply with the limits for a Class B digital device,
++pursuant to part 15 of the FCC Rules. These limits are designed to provide reasonable protection against
++harmful interference in a residential installation. This equipment generates uses and can radiate radio
++frequency energy and, if not installed and used in accordance with the instructions, may cause harmful
++interference to radio communications. However, there is no guarantee that interference will not occur in a
++particular installation. If this equipment does cause harmful interference to radio or television reception,
++which can be determined by turning the equipment off and on, the user is encouraged to try to correct the
++interference by one or more of the following measures:
++
++• Reorient or relocate the receiving antenna.
++• Increase the separation between the equipment and receiver.
++• Connect the equipment into an outlet on a circuit different from that to which the receiver is
++
++      connected.
++• Consult the dealer or an experienced radio/TV technician for help.
++
++      RF warning for Mobile device: This equipment complies with FCC radiation exposure limits set forth
++      for an uncontrolled environment. This equipment should be installed and operated with minimum
++      distance 20cm between the radiator & your body.
++
++    For Notes
++
++AIR-R  19
++
+diff --git a/knowledge_base/20250901_ICON_Pro_Manual_EN_V3.4.pdf b/knowledge_base/20250901_ICON_Pro_Manual_EN_V3.4.pdf
+new file mode 100644
+index 0000000..4cc96dc
+--- /dev/null
++++ b/knowledge_base/20250901_ICON_Pro_Manual_EN_V3.4.pdf
+@@ -0,0 +1,925 @@
++2025-09-01  Fw.v. 1.200 Hw.v. CI-2 2.4.2 / REV. 1.02  Federal
++V 3.4                                                 Communications
++                                                      Commissions
++
++MANUAL
++
++ICON-Pro
++CONTENTS
++
++• Introduction                                                                              3
++
++• Video manuals                                                                             3
++
++• Device Specifications                                                                     4
++
++• Default Device Settings                                                                   4
++
++• Device Dimensions                                                                         5
++
++• Device Connection Terminals                                                               6
++
++• Installation Recommendations:
++
++◦ Placement and Wiring                                                                      7
++
++◦ Connecting Power to the Device                                                            7
++
++◦ Wiegand Connection                                                                        7
++
++◦ Connecting Open Supervised Device Protocol (OSDP)                                         7
++
++◦ Connecting Electric Locks                                                                 7
++
++◦ Protection Against High Current Surges                                                    7
++
++• Connection Diagram:
++
++◦ Wiegand Readers                                                                           8
++
++◦ Open Supervised Device Protocol (OSDP) Readers                                            10
++
++◦ Door Sensor and Exit Button                                                               12
++
++◦ AIR-Button V 2.0                                                                          13
++
++◦ AIR-Button V 3.0                                                                          14
++
++◦ Request to Exit PIR Motion Sensor                                                         15
++
++◦ Electric Locks                                                                            17
++
++• Web Interfaces:
++
++◦ Login                                                                                     18
++
++◦ Connecting to Device                                                                      18
++
++◦ Quick Start                                                                               19
++
++◦ AllDoors Cloud connection                                                                 19
++
++◦ System                                                                                    20
++
++◦ Network                                                                                   21
++
++◦ OSDP is Coming Soon!                                                                      22
++
++◦ Maintenance                                                                               23
++
++• Hardware Reset                                                                            24
++
++• LED Indication                                                                            24
++
++• Glossary                                                                                  25
++
++• FCC Caution                                                                               27
++
++• For Notes                                                                                 27
++
++Did you find an error or have a question? Please email us at https://support.lumiring.com.
++
++ICON-Pro                                                                                        2
++    Introduction
++
++   This document provides detailed information on the ICON-Pro Controller device structure and steps for
++installing and connecting it.
++
++   It also includes instructions for preventing or troubleshooting many common problems. This guide is
++for informational purposes only, and the actual product takes precedence in case of any discrepancies.
++
++   All instructions, software, and functionality are subject to change without prior notice. The latest
++version of the manual and additional documentation can be found on our website or by contacting
++customer support.
++
++   The user or installer is responsible for complying with local laws and privacy regulations when
++collecting personal data while using the product.
++
++   Video manuals
++
++   We’ve created these video manuals to make device usage simple and seamless for you. Our goal is to
++provide clear, step-by-step guidance that addresses common challenges and ensures you can maximize
++the potential of our device with minimal effort. Whether you’re setting up the device, troubleshooting
++issues, or exploring advanced features, these tutorials are designed to enhance your experience and save
++you time.
++
++Quick Start Guide  Device Wizard  Access Point Wizard
++      5:00 min.       1:30 min.           1:40 min.
++
++ICON-Pro                                               3
++Device Specifications
++
++Voltage:                                             • Power over Ethernet (10/100 Mbit)
++• 12 or 24 VDC operation                                   IEEE802.3/802.3af
++• The power supply determines the voltage at the
++                                                     • Wiegand 4, 8, 26, 32, 33, 34, 35, 36, 37, 40,
++      outputs.                                             42, 48, 56 bit
++• 0.15A @12 VDC, 0.075A @ 24 VDC current
++                                                     • OSDP via RS-485
++      consumption                                    • USB ports (Type-C) for firmware update
++• POE 802.3af (15.4W)                                Memory storage:
++• Total output current when powered by POE 0.6       • 100,000 cards
++                                                     • 250,000 events
++      A @ 11.5 VDC                                   Dimensions (L x W x H):
++ATTENTION:                                           • 5.9" x 3.15" x 1.38" (150 x 80 x 35 mm)
++The Readers power is pass-through. If the device is  Mounting method:
++powered with 24V, the readers will receive the same  • Wall mount/Din rail mount (option)
++power.                                               Weight:
++Outputs:                                             • 6.75 oz (191 g)
++• Four (4) dry form “C” 1.5A rated relay outputs.    Temperature:
++Inputs:                                              • Operation: -40°F ~ 149°F (-40°C ~ 65°C)
++• Nine (9) inputs (dry contact type) from 0 to 5     • Storage: -40°F ~ 158°F (-40°C ~ 70°C)
++                                                     Relative humidity
++      volts                                          • 5-85 % RH without condensation
++Communication interfaces:
++• Wi-Fi 802.11 b/g/n 2.4 GHz
++
++    Default Device Settings                          Web page login:
++                                                     • admin
++   Wi-Fi device name when searching:                 Web page password:
++   • ICON-Pro_(serial_number)                        • admin123
++   Access point (AP) Wi-Fi IP address of the         AP Wi-Fi timer:
++device:                                              • 30 minutes
++   • 192.168.4.1
++   Ethernet IP address of the device:
++   • DHCP
++   Wi-Fi password:
++   • None (factory default)
++
++ICON-Pro                                                                                              4
++Device Dimension
++
++          3.15"
++
++                         5.31"
++                         5.9"
++
++1.38"
++
++                 2.125"  RFID CARD
++
++                                    125, 65535
++
++                         3.375"
++
++ICON-Pro                                        5
++Device Connection Terminals
++
++                        RJ-45 Ethernet Port
++                        Local Area Network
++
++USB Service Port                             EXT 1
++              Type-C                         Emergency IN
++                                             RS-485 B-
++   LED Indication                            RS-485 A+
++                 Red-
++                                             Door 3 IN
++              Yellow-                        Request to Exit
++                 Blue-                       GND
++                                             Contact 3
++           Power IN
++                 GND                         Door 4 IN
++                +VDC                         Request to Exit
++                                             GND
++           Door 2 IN                         Contact 4
++           Contact 2
++                                             Relay 1
++                 GND                         NC
++    Request to Exit                          C
++                                             NO
++     Wiegand 2 IN
++                +VDC                         Relay 2
++                 GND                         NC
++               Buzzer                        C
++                  LED                        NO
++                   D1
++                   D0                        Relay 3
++                                             NC
++           Door 1 IN                         C
++           Contact 1                         NO
++
++                 GND                         Relay 4
++    Request to Exit                          NC
++                                             C
++     Wiegand 1 IN                            NO
++                +VDC
++                 GND                         Service Button
++               Buzzer                        Reset/Wi-Fi AP
++                  LED
++                   D1
++                   D0
++
++ICON-Pro                                                      6
++Installation Recommendations
++
++Placement and Wiring
++• Connecting the Controller via Wi-Fi should be considered an alternative without an Ethernet connection,
++
++    but not as the primary method.
++• It is recommended that an Ethernet connection be used as the primary method. If a Wi-Fi connection is
++
++    chosen, the controllers should be placed as close as possible to the access points to minimize
++    communication delays.
++• After installation, it's crucial to check the Wi-Fi signal strength. Ensure the minimum allowable signal level is
++    -55 dB.
++• If the signal strength is lower, consider moving the AP closer to the device or using a more robust antenna
++    on the AP or device.
++• Remember, avoiding metal surfaces is vital as they can reduce the quality of the Wi-Fi connections.
++Connecting Power to the Device
++• A power cable with a suitable cross-section is used to supply the current consumption of the connected
++    devices. Make sure to use two separate power supplies for the device and the actuators.
++Wiegand Connection
++• Connect the readers using the same Wiegand format and byte order to avoid differences in card code
++    reading and subsequent confusion in the system.
++• The Wiegand communication line length should be at most 328 ft (100 m). If the communication line is
++    longer than 16.4 ft (5 m), use a UTP Cat5e cable. The line must be at least 1.64 feet (0.5 m) away from
++    power cables.
++• Keep the reader power line wires as short as possible to avoid a significant voltage drop across them. After
++    laying the cables, ensure the power supply voltage to the reader is at least 12 VDC when the locks are on.
++Connecting Open Supervised Device Protocol (OSDP)
++• The OSDP uses an RS-485 interface that is designed for long-distance communications. It operates at up
++    to 3,280 ft (1,000 m) with good resistance to noise interference.
++• The OSDP communication line should be far from power cables and electric lights. A one-twisted pair,
++    shielded cable, 120 impedance, 24 AWG should be used as the OSDP communication line (if possible,
++    ground the shield at one end).
++Connecting Electric Locks
++• Connect devices via relays if galvanic isolation from the device is needed or if you need to control high-
++    voltage devices or devices with significant current consumption.
++• To ensure reliable system operations, it is best to use one power source for the controllers and a separate
++    one for the actuators.
++Protection Against High Current Surges
++• A protective diode protects the devices from reverse currents when triggering an electromagnetic or
++    electromechanical lock. A protective diode or varistor is installed near the lock parallel to the contacts.
++• THE DIODE IS CONNECTED IN REVERSE POLARITY.
++
++Diodes: (Connect in reverse polarity) SR5100, SF18, SF56, HER307, and similar.
++
++Varistors: (No polarity required)  5D330K, 7D330K, 10D470K, 10D390K, and similar.
++
++ICON-Pro                                                                                                             7
++Connection Diagram
++
++Wiegand Readers
++
++12        ATTENTION:
++34        The Readers power is pass-through. If
++56        the device is powered with 24V, the
++78        readers will receive the same power.
++90
++
++*#
++
++12                               Green Data 0
++34                                White Data 1
++56                             Orange Green LED
++78                     Brown/Yellow Red LED/Beeper
++90                                Black GND
++
++*#                                  Red +VDC
++
++          • Before you start building cable networks for Wiegand
++              readers, read the interface specifications.
++
++          • The wiring diagram is shown as an example. In reality,
++              wire colors may vary depending on the model of the
++              third-party reader.
++
++          • Please refer to the reader manufacturer's instructions.
++
++ICON-Pro                                                             8
++Connection Diagram
++
++Wiegand Readers
++
++                    Green Data 0
++                     White Data 1
++                  Orange Green LED
++          Brown/Yellow Red LED/Beeper
++                     Black GND
++
++                       Red +VDC
++
++          • Before you start building cable networks for
++              Wiegand readers, read the interface
++              specifications.
++
++          • The wiring diagram is shown as an example. In
++              reality, wire colors may vary depending on the
++              model of the third-party reader.
++
++          • Please refer to the reader manufacturer's
++              instructions.
++
++ICON-Pro                                                      9
++Connection Diagram
++
++OSDP Readers
++
++                    Power
++                    Supply
++
++ICON-Pro              Purple OSDP B
++                       Yellow OSDP A
++                        Black GND
++
++                          Red +VDC
++                        Black GND
++
++                                   Power
++                                   Supply
++
++                    Next
++                    Readers
++
++                                                                                  10
++Connection Diagram                                   To the
++                                                     controller
++OSDP Readers
++                                                                    Power
++                                                                    Supply
++
++Warning  BE SURE TO CONNECT THE GND OF THE
++         CABLE FROM THE CONTROLLER TO THE
++         GND OF THE AUXILIARY POWER SUPPLY!
++
++         DO NOT USE POWER SUPPLIES WITH
++         DIFFERENT VOLTAGE LEVELS!
++
++Warning  All branches from the primary data cable
++         should be kept as short as possible.
++         The length of taps from the primary data
++         cable should be at most 8 inches.
++
++Warning  Always route the main data cable away from  Purple OSDP B
++         power cables and sources of electrostatic   Yellow OSDP A
++         interference.                                Black GND
++
++                                                        Red +VDC
++                                                      Black GND
++
++                                                                 Power
++                                                                 Supply
++
++Warning  Terminal resistors ensure that the
++         "open" end of the cable is matched
++         to the rest of the line, eliminating
++         signal reflection.
++
++         The nominal resistance of the
++         resistors corresponds to the wave
++         impedance of the cable, and for
++         twisted pair cables is typically 100
++         to 120 ohms.
++
++         Install a 120 ohm terminating
++         resistor on the outermost reader if
++         the cable runs more than 150 feet.
++
++         See RS-485 interface specifications
++         for more information.
++
++ICON-Pro                                                                    11
++ Connection Diagram
++
++ Door Sensor and Exit Button
++
++Door Sensor
++
++                           Yellow Contact
++                            Black GND
++                            Black GND
++                           Green REX
++
++          Exit Button
++
++          • Specify the "Open" condition in the Сontroller settings when
++              a door sensor is connected.
++
++          • Connecting to the "DOOR 3,» and "DOOR 4" connector is
++              done in the same way.
++
++          • Specify the "Closed" condition in the Сontroller settings when
++              an exit button is connected.
++
++ICON-Pro                                                                    12
++Connection Diagram
++
++AIR-Button V 2.0
++
++AIR-B
++
++(V 2.0 Four-Wire)
++
++AVE
++
++OPEN
++
++            Red +VDC
++          Black GND
++
++            Blue REX
++          Green Green LED
++
++      • Connecting to the “DOOR 2,” “DOOR 3,” and
++          “DOOR 4" connectors is done in the same way.
++
++      • The buttons is default factory settings is
++          “Normally Open.”
++
++      • This means that a low level signal for control will
++          appear on the blue wire when you put your hand
++          to the optical sensor.
++
++      • When setting the exit button in the cloud service,
++          select the "closed" condition.
++
++      • This means that when a "low level" signal is input
++          to the REX input, the controller relay will be
++          activated.
++
++ICON-Pro                                                     13
++    Connection Diagram
++
++     AIR-Button V 3.0
++
++AIR-B
++
++(V 3.0 Five-Wire)
++
++             Red +VDC
++           Black GND
++          Yellow REX
++          Green (reserved)
++
++            Blue Green LED
++
++• Connecting to the “DOOR 2,” “DOOR 3,” and
++    “DOOR 4" connectors is done in the same way.
++
++• The buttons is default factory settings is “Normally
++    Open.”
++
++• This means that a low level signal for control will
++    appear on the blue wire when you put your hand to
++    the optical sensor.
++
++• When setting the exit button in the cloud service,
++    select the "closed" condition.
++
++• This means that when a "low level" signal is input
++    to the REX input, the controller relay will be
++    activated.
++
++ICON-Pro                                                14
++ Connection Diagram
++
++ Request to Exit PIR Motion Sensor
++
++Motion Sensor
++
++          NС
++                C
++                       NO
++                              +VDC
++                                     GND
++
++• Connecting to the “DOOR 2,” “DOOR 3,” and “DOOR 4"
++    connectors is done in the same way.
++
++• The motion sensor acts as an automatic exit button and
++    is therefore connected as an exit button. Connect the
++    wires to contacts C (Common) and NO (Normally Open)
++    of the motion sensor relay.
++
++• Use the pulse method to control the relay, which is
++    activated when the motion sensor is triggered.
++
++• When configuring the exit button in the cloud service,
++    select the "closed" condition. This means that when a
++    «low level" signal is input to the REX input, the
++    controller relay will be activated.
++
++ICON-Pro                                                   15
++ Connection Diagram
++
++ Request to Exit PIR Motion Sensor
++
++Motion Sensor
++
++          NС
++                C
++                       NO
++                              +VDC
++                                     GND
++
++• Connecting to the “DOOR 2,” “DOOR 3,” and “DOOR 4"
++    connectors is done in the same way.
++
++• The motion sensor acts as an automatic exit button and
++    is therefore connected as an exit button. Connect the
++    wires to contacts C (Common) and NO (Normally Open) of
++    the motion sensor relay.
++
++• Use the pulse method to control the relay, which is
++    activated when the motion sensor is triggered.
++
++• When configuring the exit button in the cloud service,
++    select the "closed" condition. This means that when a
++    «low level" signal is input to the REX input, the
++    controller relay will be activated.
++
++ICON-Pro                                                    16
++Connection Diagram
++
++Electric Locks
++
++                         • Specify the “Impulse” control type in the controller
++                             settings when a strike lock is connected.
++
++                         • Specify the “Trigger” control type in the controller
++                             settings when a magnetic lock is connected.
++
++                            Strike Lock
++
++                    GND  Lock 1        Warning
++                         Lock 2
++                         +VDC       Use
++                                 Correct
++                                 Polarity!
++
++                                           Warning
++
++                                     Use
++                                   Correct
++                                  Polarity!
++
++                                    Magnetic
++                                          Lock
++
++          Power                Warning
++          Supply
++                         A protective diode is used to protect the
++ICON-Pro                 Controller from reverse currents when an
++                         electromagnetic or electromechanical
++                         lock is triggered. The protective diode is
++                         is connected in parallel with the contacts of the lock. THE
++                         DIODE IS CONNECTED IN REVERSE POLARITY. The diode
++                         must be installed directly on the contacts of the lock.
++                         Suitable diodes include SR5100, SF18, SF56, HER307, and
++                         similar. Instead of diodes, varistors 5D330K, 7D330K,
++                         10D470K, and 10D390K can be used, for which there is no
++                         need to observe polarity.
++
++                                                                                                              17
++Login
++
++Connecting to Device
++
++   Connecting to the built-in Wi-Fi access point (AP).
++   Step 1. Connect the device to a power source.
++   Step 2. Search for Wi-Fi and connect to the ICON-Pro_xxxxxxxxx network.
++   Step 3. In the address bar of your browser, enter the factory IP address (192.168.4.1) and press “Enter.” Wait
++for the start page to load.
++   Step 4. Enter the user name and password (if they have already been set) and press “Enter.” If the device is
++new or has been previously reset, enter login: admin, pass: admin123 and press “Enter.”
++   Connecting via Ethernet
++   Reminder: You must first change the network settings of the Controller if they are different from those
++of the network you are connecting to. The Controller and the mobile device from which you are
++configuring must be on the same network.
++   Step 1. Connect the Ethernet cable to the device using an adapter or by connecting the wires, as shown in the
++diagram below.
++   Step 2. Connect the device to a power source.
++   Step 3. In the address bar of your browser, enter the device IP address and press enter.
++   Step 4. Enter the user name and password (if they have already been set) and press “Enter.” If the device is
++new or has been previously reset, enter login: admin, pass: admin123 and press “Enter.”
++
++ICON-Pro  18
++Quick Start
++
++   The device's interface allows you to use the Quick Start feature to quickly set up your device to
++connect to the Internet and add it to a cloud service.
++
++   Network:                                                 • Follow the instructions provided by the wizard.
++   Select the connection method: Wi-Fi or Ethernet.
++   • A. Wi-Fi:                                           If you want to add controller directly to your
++                                                         account you must to enter your Cloud Account
++        ◦ Click on the empty Service Set Identifier      ID and click “Submit.”
++             (SSID) field to scan and choose a network.
++                                                            Security:
++        ◦ Enter the network password and click              • Checkbox: Use the same password for two
++             “Submit” to establish the connection.
++                                                                 purposes.
++   • B. Ethernet:                                           • The entered SSID will be displayed during Wi-
++        ◦ Submit the entered information to confirm
++             the settings.                                       Fi scanning.
++                                                            • Choose a strong and unique password, and
++   Cloud:
++   To connect to the cloud, the controller only                  keep it secured at all times.
++requires an active internet connection. The device will
++automatically establish the connection.                     Note: After changing the factory default
++   To add the device to your account, follow these       password to connect to the built-in Wi-Fi AP or
++steps:                                                   the login password, a reboot may be required,
++   • Create the AllDoors cloud account                   increasing the time until the device appears in the
++                                                         cloud service.
++        (alldoors.online)
++   • Go to the Devices section and use the Setup
++
++        Wizard .
++   • Click the Add New button.
++
++ICON-Pro                                                                                              19
++System
++
++This section displays information about the current settings and status of the device.
++
++   The Current Status subsection displays the:           • Device’s network address.
++   • Current time and date (when the device is           • Network mode - Manual or Dynamic Host
++
++        connected to the Internet).                           Configuration Protocol (DHCP).
++   • Status and type of connection of the device to      • Network mask.
++                                                         • Domain Name Service (DNS).
++        the router in use.                               • Network port of the device.
++   • Status of the device's connection to the cloud      In the Hardware Information subsection, you
++                                                      can see the:
++        server.                                          • Device model name.
++   • Status of the built-in Wi-Fi AP.                    • Device serial number.
++   • OSDP connection status.                             • Current firmware version.
++   • Level and quality of the device's connection to     • Current hardware version of the device.
++                                                         • Web version used by the device.
++        the Wi-Fi router.                                • API version used by the device.
++   • Power supply voltage value.
++   The Network Information subsection displays
++the:
++   • Device’s current network settings.
++
++ICON-Pro                                                                                              20
++Network
++
++   In the Network section, you can set up an Internet connection via Wi-Fi or Ethernet, you can change
++the connection settings for the built-in Wi-Fi AP, and you can set its activity time. This section is also
++intended for configuration when connecting to a cloud server.
++
++   The Network subsection provides the following                   name and enter it manually when connecting.
++functions:
++                                                              • In the "Wi-Fi Timer, min" field, enter a value
++   • Select your preferred Wi-Fi or Ethernet network               from 1 to 60 minutes. If you enter 0, the
++        type. When using Wi-Fi, click on the SSID                  access point will be on all the time.
++        name field to search for available Wi-Fi
++        networks and enter the password to connect.           • HTTP port: By default, the device uses port 80.
++
++   • Select DHCP for automatic network settings or            The Cloud settings subsection allows you to
++        Manual to enter all network settings manually in   connect the Controller to a cloud server for later
++        the available fields below, then click “Connect.”  use.
++
++   • When using Ethernet, select DHCP for                     • In the Server form, you can select one of the
++        automatic network settings or Manual to enter                available servers to connect to, or select a
++        all network settings manually in the available               custom connection option if a private server is
++        fields below and then click “Update.”                        used.
++
++   The Wi-Fi AP subsection provides the following             • The Account ID form is used for adding to the
++functions:                                                           AllDoors cloud system, as you only need to
++                                                                     specify the ID to connect.
++   • In the Local Wi-Fi AP name field, enter the
++        device's network name.                                When using a private server, you must fill in the
++                                                           parameters required for connection. The
++   • In the Password field, enter the connection           parameters are determined by the properties of
++        password.                                          the server and its security level.
++
++   • ”Enable hidden mode” checkbox: hides the                 • Enter the address of the MQTT server, login
++        AP's built-in network name when searching. To                ID and password for logging in. Then specify
++        connect to the device, you must know its                     the location of the device to create the topic.
++
++ICON-Pro                                                                                                    21
++Open Supervised Device Protocol (OSDP)
++
++   The "Open Supervised Device Protocol (OSDP)"          Connecting multiple devices
++section can be used to search for devices                If you are not sure about the settings of your OSDP
++connected via the RS-485 interface. This tool            devices and there is a need to connect more than one
++allows you to assign the address and baud rate.          device, we recommend using the sequential method -
++Important notes:                                         connect each device in turn. Disconnect the previous
++• "Address" of all OSDP devices must be unique,          device, which is already configured.
++
++    and the "Baud rate" must be the same.                   Example for three devices
++• Only one OSDP device can be connected to the              • Connect the first device. Configure the port and
++
++    Controller during the search; otherwise, the device          address. Disconnect.
++    may not be detected.                                    • Connect the Second device. Configure the port
++
++Connection and Search                                            and address. Disconnect.
++• Connect the OSDP device to the controller                 • Connect the Third device. Configure the port
++
++    according to the wiring diagram on page 10.                  and address.
++    (example AIR-R reader connection)                       • Connect the First and Second devices
++• Press “Search” button. You will see the search            • Verify the connection by pressing “Search”
++    results as a list of found devices on the OSDP bus.
++    Using the controls you can change the device port    Cloud status indication
++    speed and address.                                   This functionality displays the status of OSDP settings
++    The functionality of changing these                  in AllDoors cloud.
++    parameters can be blocked for in the settings
++    of readers of different manufacturers.                         No icon - the OSDP device not configured in
++                                                                   AllDoors
++    If the functionality is available, you can set the
++    parameters you need and save them by pressing                  Red Cloud icon - the OSDP device
++    the button “ ”                                                 configured in AllDoors but not connected to
++                                                                   the controller
++
++                                                                   Green Cloud icon - the OSDP device is
++                                                                   configured in AllDoors and connected to the
++                                                                   conttroller
++
++ICON-Pro                                                 22
++Maintenance
++
++   The Firmware section displays the current           interruption during the update may cause a
++version of the unit's firmware.                        firmware update application error.
++
++   Note: It is recommended to upgrade the device          If this happens, disconnect power from the
++to the latest firmware version before use.             device for 10 seconds and reconnect.
++
++   Note: The device must be connected to the              Leave the unit switched on for 5 minutes
++Internet and close to a Wi-Fi router during the        without attempting to connect or log into the web
++update.                                                interface.
++
++   • To download a new firmware version, connect          The unit will automatically download the latest
++        to a network with Internet access in the       previously used firmware version and resume
++        Network section.                               operation.
++
++   • Click the “Check & Update” button and wait           The Restart/Reset subsection performs the
++        until the update process completes.            following actions:
++
++   • A modal window will prompt you to reboot the         • Restart - restarts the device.
++        device.
++                                                          • Full reset - resets all settings of the device to
++   • After restarting, verify that the device version          factory defaults.
++        has changed.
++                                                          The Security subsection is used to change the
++   Note: The update duration depends on the            password for logging into the interface of the
++Internet connection quality and firmware version       device:
++but usually takes a maximum of 5 minutes.
++                                                          • Enter the new login password and confirm it.
++   If the update takes more than 5 minutes,
++forcibly reboot the device by switching off the           • Apply the changes by clicking “Update.”
++power and trying the update again.
++                                                          The new password can be used the next time you
++   A power failure or network connection               log into the device interface.
++
++ICON-Pro                                               23
++Hardware Reset
++
++Hardware Reset
++   1. Hold the button down until a long beep sounds.
++   2. Release the button.
++   3. The device will start flashing red, emitting three short beeps, and then switch to flashing blue.
++   4. Wait for the blue LED to stop flashing, disconnect power to the device for 5 seconds, and
++          reconnect it.
++   5. The device will be ready for operation when the blue LED starts to glow continuously.
++
++    LED Indication
++
++ICON-Pro                                                                                                 24
++ Glossary
++
++• +VDC - Positive voltage direct current.
++• Account ID - A unique identifier associated with an individual or entity's account, used for authentication
++
++      and access to services.
++• ACU - Access control unit. The device and its software that establishes the access mode and provides
++
++      reception and processing of information from readers, control of executive devices, display and logging of
++      information.
++• API - application programming interface.
++• BLE - Bluetooth Low Energy.
++• Block in - Function for the input activating "block out" with the event "blocked by operator." It is used for
++      turnstile control.
++• Block out - Output activated when "block In" is triggered.
++• Bluetooth - A short-range wireless communication technology that enables wireless data exchange
++      between digital devices.
++• BUZZ - Output for connecting the reader wire responsible for sound or light indication.
++• Cloud - A cloud-based platform or service provided to manage and monitor an access control system
++      over the Internet. Allows administrators to manage access rights, monitor events, and update system
++      settings using a web-based interface, providing the convenience and flexibility to manage the access
++      control system from anywhere there is an Internet connection.
++• Copy protection - A method used to prevent unauthorized copying or duplication of smart cards to
++      secure the access control system and prevent possible security breaches.
++• D0 - “Data 0." A bit line with the logical value "0."
++• D1 - "Data 1." A bit line with the logical value "1."
++• DHCP - Dynamic Host Configuration Protocol. A network protocol that allows network devices to
++      automatically obtain an IP address and other parameters necessary for operation in a Transmission
++• Control Protocol/Internet Protocol TCP/IP network. This protocol works on a "client-server" model.
++• DNS - Domain Name System is a computer-based distributed system for obtaining domain information. It
++      is most often used to obtain an IP address by host name (computer or device), to obtain routing
++      information, and to obtain serving nodes for protocols in a domain.
++• DPS - Door position sensor. A device that is used to monitor and determine the current status of a door,
++      such as whether the door is open or closed.
++• Electric latch - An electronically controlled door locking mechanism.
++• Emergency in - Input for emergency situations.
++• Encryption password - Key for data protection.
++• Ethernet network - A wired computer network technology that uses cables to connect devices for data
++      transmission and communication.
++• Exit/Entry/Open button - Logic input which, when activated, activates the corresponding output. Causes
++      an event depending on the attribute used.
++• Exit/Entry/Open out - Logical output that is activated when the corresponding input is triggered. Causes
++      an event depending on the attribute used.
++• External relay - Relay with potential-free dry contact for remote control of the power supply. The relay is
++      equipped with a dry contact, which is galvanically unconnected to the power supply circuit of the device.
++• GND - Electrical ground reference point.
++• HTTP - Hypertext Transfer Protocol. A fundamental protocol for transferring data, documents, and
++      resources over the Internet.
++• RFID Identifier 125 kHz - Radio-frequency identification at 125 kHz; short-range, low-frequency
++      technology with a typical range of 7 cm to 1 m.
++• RFID Identifier 13.56 MHZ - Radio-frequency identification at 13.56 MHz; high-frequency technology
++      with short to moderate range, around 10 cm.
++• Keypad - A physical input device with a set of buttons or keys, often used for manual data entry or
++      access control.
++
++ICON-Pro  25
++ Glossary
++
++• LED - Light emitting diode.
++• Loop sensor - A device that detects the presence or passage of traffic in a certain area by means of a
++
++      closed electrical loop. Used in barriers or gates.
++• Magnetic Lock - A locking mechanism that uses electromagnetic force to secure doors, gates, or access
++
++      points.
++• MQTT - Message Queuing Telemetry Transport. A server system that coordinates messages between
++
++      different clients. The broker is responsible, among other things, for receiving and filtering messages,
++      identifying the clients subscribed to each message, and sending messages to them.
++• NC - Normally closed. Configuration of a changeover contact that is closed in the default state and open
++      when activated.
++• NO - Normally open. A switch contact configuration that is open in its default state and closes when
++      activated.
++• No-touch button - A button or switch that can be activated without physical contact, often using
++      proximity or motion-sensing technology.
++• Open collector - A transistor switch configuration in which the collector is left unconnected or open,
++      typically used for signal grounding.
++• OSDP - Open Supervised Device Protocol. A secure communication protocol used in access control
++      systems for device-to-device data exchange.
++• Pass control - The process of regulating, monitoring, or granting permission for individuals to enter or exit
++      a secure area.
++• Power supply - A device or system that provides electrical energy to other devices, enabling them to
++      operate and function.
++• Radio 868/915 MHZ - A wireless communication system operating on the 868 MHz or 915 MHz
++      frequency bands.
++• Reader - A device that scans and interprets data from RFID or smart cards, often used for access control
++      or identification.
++• Revers byte order - A process of reordering the sequence of bytes in a data stream, often for
++      compatibility or data conversion.
++• REX - Request to exit. An access control device or button used to request to exit from a secured area.
++• RFID - Radio-frequency identification. A technology for wireless data transmission and identification using
++      electromagnetic tags and readers.
++• RS-485 - A standard for serial communication used in industrial and commercial applications, supporting
++      multiple devices over a shared network.
++• Strike lock - An electronic locking mechanism that releases a door's latch or bolt when electrically
++      activated, often used in access control systems.
++• Terminal block - A modular connector used for connecting and securing wires or cables in electrical and
++      electronic systems.
++• Topic - In the context of MQTT, a label or identifier for published messages, enabling subscribers to filter
++      and receive specific information.
++• Unblock in - An input or signal used to release a lock, barrier, or security device, allowing access to a
++      previously secured area.
++• Unblock out - An output or signal used to release a lock, barrier, or security device to allow exit or
++      opening.
++• Wiegand format - A data format used in access control systems, typically for transmitting data from card
++      readers to controllers.
++• Wiegand interface - A standard interface used in access control systems to communicate data between
++      card readers and access control panels.
++• Wi-Fi AP - Wireless access point. A device that allows wireless devices to connect to a network.
++• Wireless access control gateway - A device that manages and connects wireless access control
++      devices to a central system or network.
++
++ICON-Pro  26
++    FCC Caution
++
++   This device complies with part 15 of the FCC Rules. Operation is subject to the following two
++conditions: (1) This device may not cause harmful interference, and (2) this device must accept any
++interference received, including interference that may cause undesired operation.
++
++   Any Changes or modifications not expressly approved by the party responsible for compliance could
++void the user's authority to operate the equipment.
++
++   Note: This equipment has been tested and found to comply with the limits for a Class B digital device,
++pursuant to part 15 of the FCC Rules. These limits are designed to provide reasonable protection against
++harmful interference in a residential installation. This equipment generates uses and can radiate radio
++frequency energy and, if not installed and used in accordance with the instructions, may cause harmful
++interference to radio communications. However, there is no guarantee that interference will not occur in a
++particular installation. If this equipment does cause harmful interference to radio or television reception,
++which can be determined by turning the equipment off and on, the user is encouraged to try to correct the
++interference by one or more of the following measures:
++
++• Reorient or relocate the receiving antenna.
++• Increase the separation between the equipment and receiver.
++• Connect the equipment into an outlet on a circuit different from that to which the receiver is
++
++      connected.
++• Consult the dealer or an experienced radio/TV technician for help.
++
++      RF warning for Mobile device: This equipment complies with FCC radiation exposure limits set forth
++      for an uncontrolled environment. This equipment should be installed and operated with minimum
++      distance 20cm between the radiator & your body.
++
++    For Notes
++
++ICON-Pro  27
++
+diff --git a/knowledge_base/20260316_WW_Manual_EN_V4.2.pdf b/knowledge_base/20260316_WW_Manual_EN_V4.2.pdf
+new file mode 100644
+index 0000000..b488451
+--- /dev/null
++++ b/knowledge_base/20260316_WW_Manual_EN_V4.2.pdf
+@@ -0,0 +1,1246 @@
++2026-03-16  Fw.v. 4.007 Hw.v. 2.09  Federal
++V 4.2                               Communications
++                                    Commissions
++
++MANUAL
++
++WIRELESS
++WIEGAND
++    CONTENTS
++
++• Introduction                                                    3
++
++• Default Device Settings                                         3
++
++• Device Specifications                                           4
++
++• Radio Transceiver Specifications                                4
++
++• Device Dimensions                                               5
++
++• Slave Device Connection Terminals                               6
++
++• Master Device Connection Terminals                              7
++
++• Display
++
++    ◦ Unit Designation                                            8
++
++    ◦ Interactions with Buttons                                   8
++
++    ◦ Screens                                                     8
++
++    ◦ Understanding the information displayed                     9
++
++• Installation Recommendations:
++
++    ◦ Connecting the OEM Antenna                                  9
++
++    ◦ Connecting the Antenna Extension Cord (optional accessory)  10
++
++    ◦ Placement and Wiring                                        10
++
++    ◦ Connecting Power to the Device                              10
++
++    ◦ Wiegand Connection                                          10
++
++    ◦ Connecting OSDP                                             10
++
++    ◦ Connecting Electric Locks                                   10
++
++    ◦ Protection Against High Current Surges                      10
++
++    ◦ Recommendations for Connection                              11
++
++    ◦ Pairing                                                     11
++
++    ◦ Automatic Recovery in Case of Connection Loss               11
++
++    ◦ Pairing Features                                            11
++
++• Slave Device (Connection Diagram):
++
++    ◦ Wiegand Readers                                             13
++
++    ◦ Door Sensor & Exit Button                                   15
++
++    ◦ AIR-Button V2.0                                             16
++
++    ◦ AIR-Button V3.0                                             17
++
++    ◦ Request to Exit PIR Motion Sensor                           18
++
++    ◦ Electric Lock                                               20
++
++• Master Device (Connection Diagram to the ICON-Pro Controller):
++
++    ◦ Wiegand Outputs                                             21
++
++    ◦ REX Outputs, CONTACT Outputs                                22
++
++    ◦ Relay Inputs                                                23
++
++    ◦ Mercury board connection (REX&CONTACT. For use with non-supervised input mode) 24
++
++• Web Interface                                                   25
++
++• Hardware Reset & LED indication                                 30
++
++• Glossary                                                        31
++
++• FCC Caution                                                     34
++
++• For Notes                                                       34
++
++WW                                                                                       2
++    Introduction
++
++   This document provides detailed information on the structure of the Wireless Wiegand Master-Slave
++Device radio transmitter kit and instructions for installation and connection.
++
++   It also includes instructions that identify potential risks and methods for troubleshooting common
++problems. This guide is for informational purposes only, and in the event of any discrepancies, the actual
++product takes precedence.
++
++   All instructions, software, and functionality are subject to change without prior notice. The latest
++version of this manual and additional documentation can be found on our website or by contacting
++customer support.
++
++   The user or installer is responsible for complying with local laws and privacy regulations.
++
++ Default Device Settings            Web page login:
++                                    • admin
++Wi-Fi device name when searching:   Web page password:
++• WW_M/SD_(serial_number)           • admin123
++AP Wi-Fi IP address of the device:  AP Wi-Fi timer:
++• 192.168.4.1                       • 30 minutes
++Wi-Fi password:
++• None (factory default)
++
++    Important notices
++
++   OSDP Configuration
++   The Wireless Wiegand (WW) gateway wirelessly transmits access-control signals but does NOT configure,
++modify, or negotiate the communication protocols it transmits.
++   All protocol parameters must be configured directly on the controller and reader, per the manufacturer’s
++instructions.
++
++   PROPRIETARY PROTOCOLS NOT SUPPORTED
++   The Wireless Wiegand (WW) gateway does NOT support proprietary or vendor-specific Wiegand or OSDP
++protocol implementations or extensions at this time.
++
++    Did you find an error or have a question? Please email us at https://support.lumiring.com.
++
++WW                                                                                                           3
++ Device Specifications                                         from 0 to 5 VDC
++                                                      Communication interfaces:
++Voltage:                                              • Wi-Fi 802.11 b/g/n 2.4 GHz
++• 12 or 24 VDC operation                              • Two (2) Wiegand ports from 4 to 80 bits
++• USB Powered for site surveys                        • RS-485 / OSDP
++• The voltage at the outputs is determined by the     • USB port (Type-C) for firmware update
++                                                      Range:
++      power supply.                                   • Tens of miles or more (depending on
++• 0.2A @12 VDC, 0.1A @ 24 VDC current
++                                                            environment and elevation)
++      consumption                                     Encryption:
++Slave device:                                         • AES128
++• Outputs:                                            Dimensions (L x W x H):
++                                                      • 5.9" x 3.15" x 1.38" (150 x 80 x 35 mm)
++    ◦ Four (4) dry form “C” 1.5A rated relay
++         outputs                                            excluding antenna
++                                                      Mounting method:
++• Inputs:                                             • Wall mount/Din rail mount (option)
++    ◦ Eight (8) dry contact inputs, 0 to 5 VDC        Weight:
++    ◦ One (1) input (dry contact) 0 to 5 VDC for      • 5.36 oz (152 g)
++         local emergency relay opening                Temperature:
++                                                      • Operation: -40°F ~ 149°F (-40°C ~ 65°C)
++ATTENTION:                                            • Storage: -40°F ~ 158°F (-40°C ~ 70°C)
++Reader power is pass-through from the device's        Relative humidity
++power supply. If the device is powered with 24V, the  • 5-85 % RH without condensation
++readers will receive the same power.                  Ingress protection rating:
++Master device:                                        • IP 20
++• Outputs:
++
++    ◦ Eight (8) outputs (dry contact) from 0 to 5
++         VDC
++
++• Inputs:
++    ◦ Four (4) relay control inputs (dry contact)
++
++ Radio Transceiver Specifications                     Channels:
++                                                      • 140 (FHSS)
++Transmit power:                                       Receiver sensitivity:
++• 1 Watt (30dBm)                                      • -117dBm
++Frequency band:
++• US/CA/MX - 915 MHz ISM
++• EU - 868 MHz SRD
++• BR - 915 MHz ISM
++• AU - 915 MHz ISM
++• CO - 915 MHZ ISM
++
++WW                                                                                               4
++Device Demension
++
++                                                4.05"
++
++               3.15"
++
++                              5.31"
++                              5.9"
++
++        1.38"         2.125"         RFID CARD
++
++WW                                              125, 65535
++
++                                     3.375"
++
++                                                            5
++    Slave Device Connection Terminals
++
++USB Service Port                       RS-485/Alarm
++              Type-C                   Alarm IN
++                                       RS-485 B-
++   LED Indication                      RS-485 A+
++                  Red
++                                       Door 3 IN
++                Green                  Request to Exit
++                  Blue                 GND
++                                       Contact 3
++           Power IN
++                 GND                   Door 4 IN
++                +VDC                   Request to Exit
++                                       GND
++           Door 2 IN                   Contact 4
++           Contact 2
++                                       Lock 1 OUT
++                 GND                   NC
++    Request to Exit                    C
++                                       NO
++     Wiegand 2 IN
++                +VDC                   Lock 2 OUT
++                 GND                   NC
++               Buzzer                  C
++                  LED                  NO
++                   D1
++                   D0                  Lock 3 OUT
++                                       NC
++           Door 1 IN                   C
++           Contact 1                   NO
++
++                 GND                   Lock 4 OUT
++    Request to Exit                    NC
++                                       C
++     Wiegand 1 IN                      NO
++                +VDC
++                 GND                   Service Button
++               Buzzer                  Reset/Wi-Fi AP
++                  LED
++                   D1
++                   D0
++
++    The manufacturer reserves the right to modify the external pin assignments and their placement, as well as the appearance of the device
++    without prior notice.
++    These changes may be made to improve functionality or ergonomics, or to comply with technical requirements and standards.
++    Users are advised to consult the latest versions of technical documentation and instructions before using the device.
++
++WW                                                                                                                                           6
++    Master Device Connection Terminals
++
++USB Service Port                        RS-485
++              Type-C
++                                        RS-485 B-
++   LED Indication                       RS-485 A+
++                  Red
++                                        Door 3 OUT
++                Green                   Request to Exit 3
++                  Blue                  GND
++                                        Contact 3
++           Power IN
++                 GND                    Door 4 OUT
++                +VDC                    Request to Exit 4
++                                        GND
++       Door 2 OUT                       Contact 4
++           Contact 2
++                 GND                    Lock 1 IN
++                                        GND
++ Request to Exit 2                      IN 1
++
++  Wiegand 2 OUT                         Lock 2 IN
++                +VDC                    GND
++                 GND                    IN 2
++               Buzzer
++                  LED                   Lock 3 IN
++                   D1                   GND
++                   D0                   IN 3
++
++       Door 1 OUT                       Lock 4 IN
++           Contact 1                    GND
++                 GND                    IN 4
++
++ Request to Exit 1                      Service Button
++                                        Reset/Wi-Fi AP
++  Wiegand 1 OUT
++                +VDC
++                 GND
++               Buzzer
++                  LED
++                   D1
++                   D0
++
++    The manufacturer reserves the right to modify the external pin assignments and their placement, as well as the appearance of the device
++    without prior notice.
++    These changes may be made to improve functionality or ergonomics, or to comply with technical requirements and standards.
++    Users are advised to consult the latest versions of technical documentation and instructions before using the device.
++
++WW                                                                                                                                           7
++    Display                                          5. Displaying card codes read from connected
++                                                         readers.
++   The information display is designed for the
++following functions:                                 This display provides operational data for:
++
++   1. Displaying the current status of the device.   • Optimization of device placement.
++   2. Providing information about the communication
++                                                     • Analysing the quality of communication in the
++        quality.                                         urban radio environment.
++   3. Displaying the operation history of the unit.
++   4. Control of inputs and outputs.
++
++By default, the display control buttons are active
++
++after the device powers on. If the display control                    1    2                 3
++buttons are not active on your device after power-
++
++up, you can activate them with the following steps:
++
++1. Briefly press the hardware side button.
++
++2. Press the down button located at the top of
++      the device.
++
++3. Briefly press the hardware side button.
++
++Device Designation             Click to go to        High Power - Outdoor Device not paired
++
++Wi-Fi AP is disabled
++
++    AP                  AP 15
++
++                         The Wi-Fi AP stays on for   Signal strength     Device is paired Low voltage level
++                           a set time using a timer
++
++Interaction with Buttons
++
++                                 ANY SCREEN            ANY SCREEN                         ANY SCREEN
++
++                               EXCLUDE START-SCREEN  EXCLUDE START-SCREEN       Wi-Fi AP- Long
++                                                                           holding the upper
++      Full Reset - A         Pair search - A              Scroll - Pages   right button on any
++long press on the left  long press on the left       are scrolled in the   screen causes the
++button on the start     button on any screen         general by Up and     AP to be raised.
++page leads to the full  (exclude start screen)       Down buttons.
++reset yes/no screen.    leads to the pair
++                        search.
++     Start Screen - A
++short press on either                  ANY SCREEN
++screen takes you to
++the start screen with        Pairing mode -
++readings.               Long holding the
++                        lower right button on
++                        any screen leads to
++                        the pairing window.
++
++WW                                                                                                    8
++    Display
++
++    AP 15                100                                            Main screen:
++                                                                        • Wi-Fi AP status and time to disconnect.
++                                                                        • Signal strength in percent.
++                                                                        • Firmware version
++                                                                        • Pairing status with the responding device.
++
++V3.28C_3
++
++                                                                        Connected  Disconnected
++
++NAME:           WW_MD_6364200                                           Device information:
++                                                                        • Name, type, and serial number.
++FW.V: 3.28CU_3       +VDC: 12.2V                                        • Firmware version & Current power supply voltage.
++                                                                        • Uptime in minutes & hours
++UPTIME:                    98 MIN./3H.                                  • Type and serial number of paired device.
++PAIRED:            WW_SD_9143548
++
++SIGNAL STRENGTH (SNR): 100 (12) 0%                                      Device information
++                                                                        • Indicates the strength of the signal as a percentage ratio.
++EVENT LOSS 10 min        0%                                             • Percentage of packet loss in the last 10 minutes.
++                                                                        • Percentage of packet loss in the last 60 minutes.
++EVENT LOSS 60 min        2%                                             • Percentage of packet loss in the last 24 hours.
++
++EVENT LOSS 24 hour       1%
++
++PACKET LOSS 10 min                                                         Packet Loss graph:
++                                                                           • Displays a packet loss graph for the last 60 seconds, 10
++                                                                   100
++                                                                   75           minutes, or 24 hours.
++                                                                   50      • Press the Up or Down button to select the desired timeframe.
++                                                                   25   Note: Statistics are reset when the unit is switched off.
++10 9 8 7 6 5 4 3 2 1 0
++                                                                           Input and output monitor
++I/O MONITORING       12                                                    • REX activation status 1 to 4.
++                                                                           • CONT. activation status 1 to 4.
++               1234                                                        • LOCK activation status 1 to 4.
++                                                                           • LED 1, 2 and BUZ 1, 2 activation status.
++
++                                                              Display of the transmitted code *
++                                                              • HEX in hexadecimal.
++                                                              • UID (Unique identifier) serial number or pin code.
++                                                              • Data source: W1, W2, or OSDP address.
++                                                              • Data bit format: 4 to 80 bits.
++
++                                                                                                                                       *Only if Enabled in Web-interface
++
++   Understanding the information displayed
++   • All incoming data is displayed sequentially on the screen. The new code is displayed at the bottom.
++   • The values in front of the data in HEX indicate the Wiegand port number and the number of data bits. This
++
++        display is the same for all ports with incoming data, including OSDP readers.
++   For example: W2_26 AE:25:CD indicates that the data came from the Wiegand 2 port in 26 bits. The
++hexadecimal code follows.
++   • Unique identifier (UID) data values should be understood as an interpretation of decimal data.
++
++WW                                                                                                                                     9
++    Installation Recommendations
++
++   Warning! Do not turn on devices without antennas installed! Doing so may damage the radio
++module and cause premature failure of the device!
++
++Connecting the OEM antenna
++• The antennas are screwed to the devices before powering up.
++• The antenna connector should be tightened by hand, without the use of improvised tools or excessive
++
++    force.
++• Tighten the connector completely and make sure that it does not unscrew when the antenna is rotated.
++
++Connecting the Antenna Extension Cord (optional accessory)
++
++    Antenna cable:                The wave impedance of the cable is 50 ohms.
++    Length:                       33 ft (10 m) MAX.
++    Input connector:              RPSMA-Female (jack).
++    Output connector:             RPSMA-Male (plug).
++    Antenna RPSMA-Female (jack):  Operating frequency 868-915MHz.
++
++Placement and Wiring
++
++• The maximum range increases when devices are placed over obstacles or in direct line of sight of each
++    other.
++
++• Try to choose Choose the best possible location for installation the best location for installation, away from
++    sources of strong radiation such as cellular repeaters, overhead power lines, electric motors, etc.
++
++• The minimum distance between active radio transmitters is determined by their performance in the radio
++    environment.
++
++• Test results show optimal operation of three active radio transmitters at a distance of one meter from each
++    other. When the number of active radio transmitters increases, delays in radio exchange are observed due
++    to the creation of intensive radio interference.
++
++• Avoid placing the device on metal surfaces, as this may reduce the quality of the radio connection.
++
++• The device is attached to the installation site so that the antenna to be folded is pointing perpendicularly
++    upwards.
++
++Connecting Power to the Device
++
++• Use a power cable with a suitable cross-section to supply the current consumption of the connected
++    devices. Make sure to use two separate power supplies for the device and the actuators.
++
++Wiegand Connection
++
++• Use the same Wiegand format and byte order to connect the readers to avoid differences in card code
++      reading and subsequent confusion in the system.
++
++• The Wiegand communication line length should not exceed 328 ft (100 m). If the communication line is
++      longer than 16.4 ft (5 m), use a UTP Cat5E cable. Keep at least 1.5 ft (0.5 m) away from power cables.
++
++• Keep the reader power line wires as short as possible to avoid a significant voltage drop across them.
++      After laying the cables, ensure the power supply voltage to the reader is at least 12 VDC when the locks
++      are on.
++
++Connecting OSDP
++
++• The OSDP uses an RS-485 interface that is designed for long-distance communications. It operates at up
++      to 3,280 ft (1,000 m) with good resistance to noise interference.
++
++• The OSDP communication line should be far from power cables and electric lights. A single twisted pair,
++      shielded cable, 120 impedance, 24 AWG should be used as the OSDP communication line (if possible,
++      ground the shield at one end).
++
++WW                                                                                                      10
++ Installation Recommendations
++
++Connecting Electric Locks
++• Connect devices via relays if galvanic isolation from the device is needed or if you need to control high-
++
++      voltage devices or devices with significant current consumption.
++• To ensure reliable system operations, it is best to use one power source for the controllers and a separate
++
++      one for the actuators.
++Protection Against High Current Surges
++• A protective diode protects the devices from reverse currents when triggering an electromagnetic or
++
++      electromechanical lock. A protective diode or varistor is installed near the lock parallel to the contacts.
++THE DIODE IS CONNECTED IN REVERSE POLARITY.
++
++    Diodes: (Connect in reverse polarity) SR5100, SF18, SF56, HER307, and similar.
++
++    Varistors: (No polarity required)  5D330K, 7D330K, 10D470K, 10D390K, and similar.
++
++Recommendations for Connection
++• Make all connections only when the power is off.
++• The wires are only connected to the removable terminal blocks.
++• Be sure to check the correct connection before switching on the unit.
++Pairing
++1. Connect the master device to a power source. Ensure the LED indicator flashes blue, indicating the pair
++
++      search mode.
++2. Connect the slave device to a power source. Also, ensure the LED indicator blinks blue to indicate the
++
++      pair search mode.
++3. When first powered out of the box or after a hardware reset, the units automatically go through the
++
++      pairing procedure, which takes approximately 10 seconds.
++4. Once this procedure is complete, the kit is ready for use.
++
++    Pairing and Unpairing Devices
++
++    Automatic Pairing (older firmware versions)
++
++    Manual Pairing (firmware V3.028 and higher):
++
++                                                                                                                                               100
++                                                                                                                     V3.28C_3
++
++WW                                                                                                                                                  11
++ Installation Recommendations
++
++Unpairing
++
++     V3.28C_3
++
++  Automatic Recovery in Case of Connection Loss
++• Over time and during operation, the surrounding radio environment can change, leading to
++
++      communication failures and reduced operating distance.
++• In the event of a dropped connection or power failure, the device will make several attempts to resume
++
++      communication, including resetting the radio module and a complete restart.
++• If the device receives no response, it will enter standby mode.
++• Once communication is restored, the unit will automatically resume operation. In some cases, it may take
++
++      up to one minute from the time the kit is started to re-establish the connection.
++Pairing Features
++• When performing device pairing, master-slave device sets should be turned on one at a time.
++• If multiple unpaired sets are powered up at the same time, a collision may occur, resulting in erroneous
++
++      data exchange on the first power-up, and therefore full operation will not be possible.
++
++WW  12
++    Slave Device: Wiegand Readers
++
++    Connection Diagram
++
++12  ATTENTION:
++34  The Readers power is pass-through. If
++56  the device is powered with 24V, the
++78  readers will receive the same power.
++90
++
++*#
++
++12            Green Data 0
++34             White Data 1
++56          Orange Green LED
++78  Brown/Yellow Red LED/Beeper
++90             Black GND
++
++*#               Red +VDC
++
++    • Before you start building cable networks for
++        Wiegand readers, read the interface
++        specifications.
++
++    • The wiring diagram is shown as an example. In
++        reality, wire colors may vary depending on the
++        model of the third-party reader.
++
++    • Please refer to the reader manufacturer's
++        instructions.
++
++WW                                                      13
++    Slave Device: Wiegand Readers
++
++    Connection Diagram
++
++              Green Data 0
++               White Data 1
++            Orange Green LED
++    Brown/Yellow Red LED/Beeper
++               Black GND
++
++                 Red +VDC
++
++    • Before you start building cable networks for
++        Wiegand readers, read the interface
++        specifications.
++
++    • The wiring diagram is shown as an example. In
++        reality, wire colors may vary depending on the
++        model of the third-party reader.
++
++    • Please refer to the reader manufacturer's
++        instructions.
++
++WW                                                      14
++    Slave Device: Door Sensor and Exit Button
++
++    Connection Diagram
++
++    • Specify the "Open" condition in the Сontroller settings when
++        a door sensor is connected.
++
++    • Connecting to the "DOOR 3" and "DOOR 4" connector is
++        done in the same way.
++
++    • Specify the "Closed" condition in the Сontroller settings
++        when an exit button is connected.
++
++WW                                                                  15
++    Slave Device: AIR-Button V 2.0
++
++     Connection Diagram
++
++AIR-B
++
++(V 2.0 Four-Wire)
++
++AVE
++
++OPEN
++
++        Red +VDC
++      Black GND
++
++        Blue REX
++      Green Green LED
++
++      • Connecting to the “DOOR 2,” “DOOR 3,” and
++          “DOOR 4" connectors is done in the same way.
++
++      • The button’s default factory setting is “Normally
++          Open.”
++
++      • This means that a low level signal for control will
++          appear on the blue wire when you put your hand
++          to the optical sensor.
++
++      • When setting the exit button in the cloud service,
++          select the "closed" condition.
++
++      • This means that when a "low level" signal is input
++          to the REX input, the controller relay will be
++          activated.
++
++WW                                                           16
++    Slave Device: AIR-Button V 3.0
++
++     Connection Diagram
++
++AIR-B
++
++(V 3.0 Five-Wire)
++
++       Red +VDC
++     Black GND
++    Yellow REX
++    Green (reserved)
++
++      Blue Green LED
++
++    • Connecting to the “DOOR 2,” “DOOR 3,” and
++        “DOOR 4" connectors is done in the same way.
++
++    • The button’s default factory setting is “Normally
++        Open.”
++
++    • This means that a low level signal for control will
++        appear on the blue wire when you put your hand to
++        the optical sensor.
++
++    • When setting the exit button in the cloud service,
++        select the "closed" condition.
++
++    • This means that when a "low level" signal is input
++        to the REX input, the controller relay will be
++        activated.
++
++WW                                                         17
++ Slave Device: Request to Exit PIR Motion Sensor
++
++ Connection Diagram
++
++Motion Sensor
++
++    NС
++          C
++                 NO
++                        +VDC
++                               GND
++
++    • Connecting to the “DOOR 2,” “DOOR 3,” and “DOOR 4"
++        connectors is done in the same way.
++
++    • The motion sensor acts as an automatic exit button and
++        is therefore connected as an exit button. Connect the
++        wires to contacts C (Common) and NO (Normally Open)
++        of the motion sensor relay.
++
++    • Use the pulse method to control the relay, which is
++        activated when the motion sensor is triggered.
++
++    • When configuring the exit button in the cloud service,
++        select the "closed" condition. This means that when a
++        «low level" signal is input to the REX input, the
++        controller relay will be activated.
++
++WW                                                             18
++ Slave Device: Request to Exit PIR Motion Sensor
++
++ Connection Diagram
++
++Motion Sensor
++
++    NС
++          C
++                 NO
++                        +VDC
++                               GND
++
++    • Connecting to the “DOOR 2,” “DOOR 3,” and “DOOR 4"
++        connectors is done in the same way.
++
++    • The motion sensor acts as an automatic exit button and
++        is therefore connected as an exit button. Connect the
++        wires to contacts C (Common) and NO (Normally Open)
++        of the motion sensor relay.
++
++    • Use the pulse method to control the relay, which is
++        activated when the motion sensor is triggered.
++
++    • When configuring the exit button in the cloud service,
++        select the "closed" condition. This means that when a
++        «low level" signal is input to the REX input, the
++        controller relay will be activated.
++
++WW                                                             19
++    Slave Device: Electric Locks
++
++    Connection Diagram
++
++                                  • Specify the “Impulse” control type in the controller
++                                      settings when a strike lock is connected.
++
++                                  • Specify the “Trigger” control type in the controller
++                                      settings when a magnetic lock is connected.
++
++                                  Strike Lock
++
++                        GND       Lock 1        Warning
++                                  Lock 2
++                                  +VDC       Use
++                                          Correct
++                                          Polarity!
++
++                                                      Warning
++
++                                               Use
++                                            Correct
++                                            Polarity!
++
++                                             Magnetic
++                                                   Lock
++
++                        Power           Warning
++                        Supply
++                                  A protective diode is used to protect the
++                                  Controller from reverse currents when an
++                                  electromagnetic or electromechanical
++                                  lock is triggered. The protective diode is
++                                  is connected in parallel with the contacts of the lock. THE
++                                  DIODE IS CONNECTED IN REVERSE POLARITY. The diode
++                                  must be installed directly on the contacts of the lock. Suitable
++                                  diodes include SR5100, SF18, SF56, HER307, and similar.
++                                  Instead of diodes, varistors 5D330K, 7D330K, 10D470K, and
++                                  10D390K can be used, for which there is no need to observe
++                                  polarity.
++
++WW                                                                                        20
++    Master Device: Wiegand Outputs
++
++    Connection Diagram to the ICON-Pro Controller
++
++    Power  w2                                      w1
++
++    Power  w2                                      w1
++
++WW                                                     21
++    Master Device: REX Outputs, Contact Outputs
++
++    Connection Diagram to the ICON-Pro Controller
++
++    d3     d4
++
++    Power  D2                                      d1
++
++    d3     d4
++
++    Power  D2                                      d1
++
++WW                                                     22
++    Master Device: Relay Inputs                                L3
++                                                                       L4
++    Connection Diagram to the ICON-Pro Controller
++
++                                                           L2
++                                                  L1
++
++    Power
++
++                   L2                                          l3
++           L1                                                          l4
++
++    Power
++
++WW                                                                         23
++   Master Device: REX & Contact outputs
++
++    Connection Diagram to the Mercury board /For use with non-supervised input mode /
++
++POWER
++
++                                                                                                                                                                                        CON 1
++                                                                                                                                                                                        REX 1
++                                                                                                                                                                                        CON 2
++                                                                                                                                                                                        REX 2
++
++                                                                                                                                                                                        CON 3
++                                                                                                                                                                                        REX 3
++                                                                                                                                                                                        CON 4
++                                                                                                                                                                                        REX 4
++
++                Power
++
++                               DC 12V Relay Module
++
++                                  8 Channel Relay Board
++                                  Opto-Isolated
++                                  High or Low Level Trigger
++
++        UTP 5E
++    UTP 5E
++
++                MERCURY BOARD
++
++WW                                                                                                                                                                                             24
++    Login
++
++Connecting to a Wi-Fi Access Point
++
++   Connecting to the built-in web server
++   Step 1. Connect the device to the +12 VDC power supply. Wait for the device to start up.
++   Step 2. Quickly press the button near the antenna and then release it to turn on the Wi-Fi hotspot.
++   Step 3. From your PC or cell phone, search for Wi-Fi networks. Select the device named WW_MD_xxxxxxxxx
++or WW_SD_xxxxxxxxx and click Сonnect.
++   Step 4. In the address bar of your browser, enter the factory IP address (192.168.4.1) and press “Enter.” Wait
++for the start page to load.
++   Step 5. Enter the user name and password (if they have already been set) and press “Enter.” If the device is
++new or has been previously reset, enter login: admin, pass: admin123 and press “Enter.”
++
++WW         25
++    System
++
++The System section displays the current status of the device, advanced network connection information,
++and device version information.
++
++The Current Status column contains the:              • Network mask.
++• Status of the connection with the pairing device.  • Gateway.
++• Radio signal strength.                             • Domain Name System (DNS).
++• Connection level when connected to the Wi-Fi       • Hypertext Transfer Protocol (HTTP) port used by
++
++    router.                                              the device.
++• Power supply voltage level.                        The Hardware column contains the:
++• The check box for Enable/Disable system audio      • Device model.
++                                                     • Device serial number.
++    notifications                                    • Firmware version.
++• The check box for Enable/Disable Wiegand           • Hardware version.
++                                                     • Web version.
++    codes page on device screen                      • Application programming interface (API) version.
++• Time settings for reboot device if connection
++
++    between Master and Slave Devices is lost
++The Network column contains the:
++• IP address used by the device.
++• Network mode - Manual or Dynamic Host
++
++    Configuration Protocol (DHCP).
++
++WW                                                   26
++    Network
++
++The Network section provides the ability to configure the built-in Wi-Fi hotspot, including connecting to
++the Internet, changing the Wi-Fi network name, and setting a password.
++
++Network                                                        1 to 60 minutes. If set to 0, AP stays ON after
++                                                               short service-button press.
++• Click in the SSID Name field to search for              HTTP port
++    available Wi-Fi networks and enter the                • Used to access the Web interface of the
++    password to connect.                                       device.
++                                                          • By default, the device uses port 80.
++• If the network to connect to is hidden, wait for     Relay blocking prevention
++    the search results and enter the network name      Note: The function is only configurable on the
++    manually.                                          slave device.
++                                                           ◦ This feature prevents the relay from getting
++• Select DHCP to get automatic network                          blocking.
++    settings or Manual to enter network settings           ◦ If the communication with the master device is
++    manually, then click «Connect."                             lost, the chosen relays will revert to their
++                                                                previous state after the specified time in the
++Wi-Fi Access Point (AP)                                         Timer field.
++                                                       • Settings for Wiegand 1 & Wiegand 2 interfaces for
++• In the "Local Wi-Fi AP Name" field, enter the            fine-tuning the Wiegand protocol for compatibility
++    network name of the device.                            of equipment from different manufacturers. Don`t
++                                                           set check-box Manual - only for service
++• In the "Password" field, enter the connection            purposes.
++    password (not set by default).                         ◦ AUTO - For common devices
++                                                           ◦ HID timing - For HID devices
++Hidden Mode                                                ◦ LUMIRING timing - for LumiRing devices
++                                                           ◦ LIFTMASTER timing - for Liftmaster devices
++• The "Enable Hidden Mode" checkbox hides
++    the network name of the device's access point
++    when searching.
++
++• To connect to the device when it is in hidden
++    mode, you need to know its name and enter it
++    manually when connecting.
++
++Wi-Fi timer
++
++• In the "Wi-Fi timer, min" field, enter a value from
++
++WW                                                                                                         27
++Maintenance
++
++   The Firmware section displays the current              Leave the unit switched on for 5 minutes
++version of the unit's firmware.                        without attempting to connect or log into the web
++                                                       interface.
++   Note: It is recommended to upgrade the device
++to the latest firmware version before use.                The unit will automatically download the latest
++                                                       previously used firmware version and resume
++   Note: The device must be connected to the           operation.
++Internet and close to a Wi-Fi router during the
++update.                                                   The Generate Log feature allows you to collect
++                                                       all device logs and download them. This is an
++   • To download a new firmware version, connect       excellent tool for troubleshooting any issues
++        to a network with Internet access in the       effectively.
++        Network section.
++                                                          The Restart/Reset subsection performs the
++   • Click the “Check & Update” button and wait        following actions:
++        until the update process completes.
++                                                          • Restart - restarts the device.
++   • A modal window will prompt you to reboot the         • Full reset - resets all settings of the device to
++        device.
++                                                               factory defaults.
++   • After restarting, verify that the device version     The Security subsection is used to change the
++        has changed.                                   password for logging into the interface of the
++                                                       device:
++   Note: The update duration depends on the               • Enter the new login password and confirm it.
++Internet connection quality and firmware version          • Apply the changes by clicking “Update.”
++but usually takes a maximum of 5 minutes.                 The new password can be used the next time you
++                                                       log into the device interface.
++   If the update takes more than 5 minutes,
++forcibly reboot the device by switching off the                                                                                28
++power and trying the update again.
++
++   A power failure or network connection
++interruption during the update may cause a
++firmware update application error.
++
++   If this happens, disconnect power from the
++device for 10 seconds and reconnect.
++
++WW
++    Firmware Update via Cloud Server                         • Search for Wi-Fi networks on your mobile device
++                                                                  and connect to the device's AP. On your phone,
++  Device features:                                                check the “Connect automatically” box when
++                                                                  joining the Wi-Fi network.
++  • The Wi-Fi receiving module supports connection
++       to networks operating on 2.4 GHz only.                • Open a Web browser and type 192.168.4.1 in
++                                                                  the address bar. Press Enter and wait for the
++  • You can manually enter the SSID name of the                   login page to load.
++       Wi-Fi network to connect to hidden networks.
++       To do so, after the end of the search, start          • Enter your login and password.
++       typing the network name in the current field.
++                                                             • Click the Network tab and search for an
++  • Wi-Fi settings take effect only after a power                 available Wi-Fi network with Internet access.
++       reset.
++                                                             • Select your preferred network, enter the
++  • The built-in WI-Fi AP is disabled every time the              password to connect, and click Connect.
++       device is rebooted or when the built-in timer
++       expires.                                              • Click the System tab to make sure that the
++                                                                  signal strength of the Wi-Fi connection is at least
++  • The device requires a high amount of bandwidth                -40 dBm. A reading of -35 dBm is the best
++       to download the firmware version from the                  connection quality, and -100 dBm is the worst
++       update server. Ensure a quality connection and             or none.
++       connection level.
++                                                             • Go to the Maintenance tab and click the “Check
++  • The device update may be interrupted if radio                 & Update” button. Wait for the update download
++       communication with the responder is in                     to complete.
++       progress.
++                                                             DO NOT DISCONNECT THE DEVICE FROM THE
++  • If the connection is lost or rebooted during the       POWER SOURCE WHILE DOWNLOADING THE
++       download, the update operation will be              UPDATE.
++       canceled in order to save the current firmware
++       version.                                              • When the update is complete, a notification will
++                                                                  appear prompting you to reboot. Click “Ok” and
++  • The device may malfunction if the power is                    wait for the device to restart with an audible
++       turned off during the update installation.                 beep.
++
++  Preliminary preparation:                                   • Power cycle the device and wait for the screen
++                                                                  to load. Press the Down button to make sure
++  BE SURE TO COMPLETE ALL PREREQUISITE                            that the firmware version has changed to the
++STEPS BEFORE YOU START UPDATING YOUR                              current one.
++DEVICE!
++                                                             Troubleshooting:
++  FAILURE TO FOLLOW THE PRECAUTIONARY
++MEASURES FOR THE UPDATE MAY RESULT IN THE                    • The message "An error occurred during the
++DEVICE NOT SWITCHING ON, SWITCHING ON WITH                        update" may be displayed in the even of a
++LIMITED FUNCTIONALITY, OR MALFUNCTIONING.                         momentary loss of communication with the
++                                                                  device, the response time baeing exceeded, or
++  IN CASE OF INCORRECT UPDATE INSTALLATION                        an unstable connection to the server. In these
++DUE TO POWER FAILURE, THE DEVICE MAY NOT BE                       situations, the update progress will be stopped
++ABLE TO BE USED UNTIL THE DEVICE IS                               at the current value. If after the error occurs, the
++REPROGRAMMED VIA USB CABLE.                                       device remains connected and the "Check &
++                                                                  Update" button is clickable, try to update again.
++  • Disconnect all input, output, and reader
++       connectors except the power supply. The device        • If the error occurs at 95% or more of the load,
++       must not receive/transmit data and must not                wait 30 seconds and reset the device power
++       process I/O status during the upgrade.                     supply. After starting the device, check the
++                                                                  version displayed on the display screen. The
++  • Turn off the power to the kit's responder. The                firmware may have been downloaded and
++       responder may continue transmitting data to the            installed, but the device has not responded after
++       device being upgraded, which may interrupt the             application.
++       upgrade process and should therefore be
++       turned off.                                           • If interface interaction is no longer available after
++                                                                  the error occurs, check the connection status of
++  • Place the device in direct line of sight from a Wi-           the built-in Wi-Fi AP. Make sure that the device's
++       Fi router with Internet access at a distance of no         Wi-Fi AP is active and you can connect to it. If
++       more than 3.3 to 6.5 feet (1-2 meters). You can            you are unable to connect to the device, reset
++       use a smartphone with an activated access                  the power of the device, activate the Wi-Fi AP,
++       point (AP) as a Wi-Fi router.                              and try to connect again.
++
++  • Before starting the update, reset the power and
++       wait for the device screen to load.
++
++  Actions with the device:
++
++  • Turn on the Wi-Fi AP by pressing the service
++       button on the side of the device.
++
++WW                                                         29
++    Device Reset
++
++                 Reset (Main method)                                    Reset (Alternative method)
++
++1. Press the button 1 for activate screen.                 1. Press the button 1 for activate screen.
++2. Hold the button 2 down for 10 seconds.                  2. Hold the Push button 3 down for 10 seconds.
++3. Wait for a long beep and screen change                  3. Wait for yellow-blue flashing and a long beep.
++                                                           4. Release the button.
++                                                     YES   5. Three consecutive beeps and one separate
++                                     FULL RESET
++                                                               beep will sound.
++                                                       NO  6. The LED will first turn red and then change to
++
++4. Release the button.                                         flashing blue.
++5. Press button 1 one time and wait for four               7. The hardware reset procedure is complete
++
++    short beeps                                                and the unit is ready for operation.
++6. Wait for device restart
++7. The hardware reset procedure is complete
++
++    and the unit is ready for operation.
++
++    A Full Reset restores device configuration to factory defaults but intentionally preserves the
++    existing pairing between devices. This approach prevents accidental loss of connectivity for
++    installations already deployed in the field.
++
++    Understanding LED indication for WW (LC)
++
++LED color/behavior    Device status                        Description
++Blue (flashing)       Waiting for pairing.                 The device is in its default state, waiting to be
++                                                           paired with another device.
++Red/Green (flashing)  No radio signal                      The device is unable to detect any radio signal.
++Green (solid)         There's a radio signal.              The device has a strong and stable radio signal
++Yellow (solid)        Excellent quality.                   connection.
++Red (solid)           There's a radio signal.              The device has a radio signal of adequate
++White (solid)         Normal quality.                      quality.
++                      There is a radio signal.             The device has a weak radio signal with poor
++                      Poor quality.                        quality.
++                      Wi-Fi AP enabled                     The device's Wi-Fi Access Point (AP) is activated.
++
++WW                                                                                                  30
++ Glossary
++
++• +VDC - Positive voltage direct current.
++• Account ID - A unique identifier associated with an individual or entity's account, used for authentication
++
++      and access to services.
++• ACU - Access control unit. The device and its software that establishes the access mode and provides
++
++      reception and processing of information from readers, control of executive devices, display and logging of
++      information.
++• API - application programming interface.
++• BLE - Bluetooth Low Energy.
++• Block in - Function for the input activating "block out" with the event "blocked by operator." It is used for
++      turnstile control.
++• Block out - Output activated when "block In" is triggered.
++• Bluetooth - A short-range wireless communication technology that enables wireless data exchange
++      between digital devices.
++• BUZZ - Output for connecting the reader wire responsible for sound or light indication.
++• Cloud - A cloud-based platform or service provided to manage and monitor an access control system
++      over the Internet. Allows administrators to manage access rights, monitor events, and update system
++      settings using a web-based interface, providing the convenience and flexibility to manage the access
++      control system from anywhere there is an Internet connection.
++• Copy protection - A method used to prevent unauthorized copying or duplication of smart cards to
++      secure the access control system and prevent possible security breaches.
++• D0 - “Data 0." A bit line with the logical value "0."
++• D1 - "Data 1." A bit line with the logical value "1."
++• DHCP - Dynamic Host Configuration Protocol. A network protocol that allows network devices to
++      automatically obtain an IP address and other parameters necessary for operation in a Transmission
++• Control Protocol/Internet Protocol TCP/IP network. This protocol works on a "client-server" model.
++• DNS - Domain Name System is a computer-based distributed system for obtaining domain information. It
++      is most often used to obtain an IP address by host name (computer or device), to obtain routing
++      information, and to obtain serving nodes for protocols in a domain.
++• DPS - Door position sensor. A device that is used to monitor and determine the current status of a door,
++      such as whether the door is open or closed.
++• Electric latch - An electronically controlled door locking mechanism.
++• Emergency in - Input for emergency situations.
++• Encryption password - Key for data protection.
++• Ethernet network - A wired computer network technology that uses cables to connect devices for data
++      transmission and communication.
++• Exit/Entry/Open button - Logic input which, when activated, activates the corresponding output. Causes
++      an event depending on the attribute used.
++• Exit/Entry/Open out - Logical output that is activated when the corresponding input is triggered. Causes
++      an event depending on the attribute used.
++• External relay - Relay with potential-free dry contact for remote control of the power supply. The relay is
++      equipped with a dry contact, which is galvanically unconnected to the power supply circuit of the device.
++• GND - Electrical ground reference point.
++• HTTP - Hypertext Transfer Protocol. A fundamental protocol for transferring data, documents, and
++      resources over the Internet.
++• RFID Identifier 125 kHz - Radio-frequency identification at 125 kHz; short-range, low-frequency
++      technology with a typical range of 7 cm to 1 m.
++• RFID Identifier 13.56 MHZ - Radio-frequency identification at 13.56 MHz; high-frequency technology
++      with short to moderate range, around 10 cm.
++• Keypad - A physical input device with a set of buttons or keys, often used for manual data entry or
++      access control.
++
++WW  31
++ Glossary
++
++• LED - Light emitting diode.
++• Loop sensor - A device that detects the presence or passage of traffic in a certain area by means of a
++
++      closed electrical loop. Used in barriers or gates.
++• Magnetic Lock - A locking mechanism that uses electromagnetic force to secure doors, gates, or access
++
++      points.
++• MQTT - Message Queuing Telemetry Transport. A server system that coordinates messages between
++
++      different clients. The broker is responsible, among other things, for receiving and filtering messages,
++      identifying the clients subscribed to each message, and sending messages to them.
++• NC - Normally closed. Configuration of a changeover contact that is closed in the default state and open
++      when activated.
++• NO - Normally open. A switch contact configuration that is open in its default state and closes when
++      activated.
++• No-touch button - A button or switch that can be activated without physical contact, often using
++      proximity or motion-sensing technology.
++• Open collector - A transistor switch configuration in which the collector is left unconnected or open,
++      typically used for signal grounding.
++• OSDP - Open Supervised Device Protocol. A secure communication protocol used in access control
++      systems for device-to-device data exchange.
++• Pass control - The process of regulating, monitoring, or granting permission for individuals to enter or exit
++      a secure area.
++• Power supply - A device or system that provides electrical energy to other devices, enabling them to
++      operate and function.
++• Radio 868/915 MHZ - A wireless communication system operating on the 868 MHz or 915 MHz
++      frequency bands.
++• Reader - A device that scans and interprets data from RFID or smart cards, often used for access control
++      or identification.
++• Reverse byte order - A process of reordering the sequence of bytes in a data stream, often for
++      compatibility or data conversion.
++• REX - Request to exit. An access control device or button used to request to exit from a secured area.
++• RFID - Radio-frequency identification. A technology for wireless data transmission and identification using
++      electromagnetic tags and readers.
++• RS-485 - A standard for serial communication used in industrial and commercial applications, supporting
++      multiple devices over a shared network.
++• Strike lock - An electronic locking mechanism that releases a door's latch or bolt when electrically
++      activated, often used in access control systems.
++• Terminal block - A modular connector used for connecting and securing wires or cables in electrical and
++      electronic systems.
++• Topic - In the context of MQTT, a label or identifier for published messages, enabling subscribers to filter
++      and receive specific information.
++• Unblock in - An input or signal used to release a lock, barrier, or security device, allowing access to a
++      previously secured area.
++• Unblock out - An output or signal used to release a lock, barrier, or security device to allow exit or
++      opening.
++• Wiegand format - A data format used in access control systems, typically for transmitting data from card
++      readers to controllers.
++• Wiegand interface - A standard interface used in access control systems to communicate data between
++      card readers and access control panels.
++• Wi-Fi AP - Wireless access point. A device that allows wireless devices to connect to a network.
++• Wireless access control gateway - A device that manages and connects wireless access control
++      devices to a central system or network.
++
++WW  32
++    Supported Reader Models
++
++WW                           33
++    FCC Caution
++
++   This device complies with part 15 of the FCC Rules. Operation is subject to the following two
++conditions: (1) This device may not cause harmful interference, and (2) this device must accept any
++interference received, including interference that may cause undesired operation.
++
++   Any Changes or modifications not expressly approved by the party responsible for compliance could
++void the user's authority to operate the equipment.
++
++   Note: This equipment has been tested and found to comply with the limits for a Class B digital device,
++pursuant to part 15 of the FCC Rules. These limits are designed to provide reasonable protection against
++harmful interference in a residential installation. This equipment generates uses and can radiate radio
++frequency energy and, if not installed and used in accordance with the instructions, may cause harmful
++interference to radio communications. However, there is no guarantee that interference will not occur in a
++particular installation. If this equipment does cause harmful interference to radio or television reception,
++which can be determined by turning the equipment off and on, the user is encouraged to try to correct the
++interference by one or more of the following measures:
++
++• Reorient or relocate the receiving antenna.
++• Increase the separation between the equipment and receiver.
++• Connect the equipment into an outlet on a circuit different from that to which the receiver is
++
++      connected.
++• Consult the dealer or an experienced radio/TV technician for help.
++
++      RF warning for Mobile device: This equipment complies with FCC radiation exposure limits set forth
++      for an uncontrolled environment. This equipment should be installed and operated with minimum
++      distance 20cm between the radiator & your body.
++
++    For Notes
++
++WW  34
++
+diff --git a/list_last_10_emails.py b/list_last_10_emails.py
+new file mode 100644
+index 0000000..59a23ae
+--- /dev/null
++++ b/list_last_10_emails.py
+@@ -0,0 +1,39 @@
++import asyncio
++import aioimaplib
++from app.config import settings
++
++
++async def list_last_10_emails():
++    print(f"Connecting to {settings.IMAP_HOST}...")
++    try:
++        client = aioimaplib.IMAP4_SSL(settings.IMAP_HOST, settings.IMAP_PORT)
++        await client.wait_hello_from_server()
++        await client.login(settings.IMAP_USER, settings.IMAP_PASS)
++        await client.select("INBOX")
++
++        status, data = await client.search("ALL")
++        if status == "OK":
++            msg_ids = [m.decode() for m in data[0].split()]
++            last_10 = msg_ids[-10:]
++            print(f"Total messages: {len(msg_ids)}. Showing last {len(last_10)}:")
++
++            for msg_id in reversed(last_10):
++                # Fetch only subject
++                _, msg_data = await client.fetch(
++                    msg_id, "(BODY[HEADER.FIELDS (SUBJECT)])"
++                )
++                # msg_data format in aioimaplib: [b'ID (BODY[HEADER.FIELDS (SUBJECT)] {length}', b'Subject: ...', b')']
++                subject = "Unknown"
++                if len(msg_data) > 1:
++                    subject = msg_data[1].decode("utf-8", errors="ignore").strip()
++                print(f" - #{msg_id}: {subject}")
++        else:
++            print(f"Search failed: {status}")
++
++        await client.logout()
++    except Exception as e:
++        print(f"IMAP Error: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(list_last_10_emails())
+diff --git a/ngrok.exe b/ngrok.exe
+new file mode 100644
+index 0000000..1d7f352
+Binary files /dev/null and b/ngrok.exe differ
+diff --git a/requirements.txt b/requirements.txt
+index a469e14..72a4450 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -14,3 +14,5 @@ textual==0.52.1
+ mail-parser==3.15.0
+ beautifulsoup4==4.12.3
+ html2text==2024.2.26
++chromadb==0.5.3
++pymupdf==1.24.3
+diff --git a/test_imap_conn.py b/test_imap_conn.py
+new file mode 100644
+index 0000000..d08458c
+--- /dev/null
++++ b/test_imap_conn.py
+@@ -0,0 +1,30 @@
++import asyncio
++import aioimaplib
++from app.config import settings
++
++
++async def test_imap():
++    print(
++        f"Connecting to {settings.IMAP_HOST}:{settings.IMAP_PORT} as {settings.IMAP_USER}..."
++    )
++    try:
++        client = aioimaplib.IMAP4_SSL(settings.IMAP_HOST, settings.IMAP_PORT)
++        await client.wait_hello_from_server()  # Correct method name for aioimaplib
++        await client.login(settings.IMAP_USER, settings.IMAP_PASS)
++
++        await client.select("INBOX")
++
++        status, data = await client.search("UNSEEN")
++        if status == "OK":
++            msg_ids = data[0].split()
++            print(f"Connection successful. Found {len(msg_ids)} unseen messages.")
++        else:
++            print(f"Search failed with status: {status}")
++
++        await client.logout()
++    except Exception as e:
++        print(f"IMAP Error: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(test_imap())
+diff --git a/test_smtp_send.py b/test_smtp_send.py
+new file mode 100644
+index 0000000..0d383e5
+--- /dev/null
++++ b/test_smtp_send.py
+@@ -0,0 +1,23 @@
++import asyncio
++from app.services.smtp import send_email
++from app.utils.logging import setup_logging
++
++
++async def main():
++    setup_logging()
++    recipient = "dzentec@gmail.com"  # Укажите ваш email для теста
++
++    print(f"Отправка тестового письма на {recipient}...")
++    try:
++        await send_email(
++            to=recipient,
++            subject="Тест системы AI Support Sentinel",
++            body_text="Это тестовое сообщение от системы AI Support Sentinel v3.3. Если вы его получили, SMTP настроен верно.",
++        )
++        print("Письмо успешно отправлено!")
++    except Exception as e:
++        print(f"Ошибка при отправке: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(main())
+diff --git a/test_telegram_notification.py b/test_telegram_notification.py
+new file mode 100644
+index 0000000..34e17ff
+--- /dev/null
++++ b/test_telegram_notification.py
+@@ -0,0 +1,29 @@
++import asyncio
++from app.tasks.notification import notify_operator
++from app.models import Ticket
++from app.utils.logging import setup_logging
++
++
++async def test_telegram():
++    setup_logging()
++
++    # Создаем фиктивный тикет для теста
++    mock_ticket = Ticket(
++        id=999,
++        sender_name="Тестовый Пользователь",
++        sender_email="test@example.com",
++        subject="Тест уведомления бота",
++    )
++
++    print("Отправка тестового уведомления в Telegram...")
++    try:
++        await notify_operator(
++            mock_ticket, "Это тестовый черновик ответа, который сгенерировал ИИ."
++        )
++        print("Уведомление успешно отправлено!")
++    except Exception as e:
++        print(f"Ошибка при отправке: {e}")
++
++
++if __name__ == "__main__":
++    asyncio.run(test_telegram())
+diff --git a/test_zoho_parser.py b/test_zoho_parser.py
+new file mode 100644
+index 0000000..44a8386
+--- /dev/null
++++ b/test_zoho_parser.py
+@@ -0,0 +1,34 @@
++from app.services.email_parser import normalize_email
++
++
++def test_zoho_parsing():
++    # Имитация "сырых" байтов письма с ZOHO-номером в теле
++    raw_email = b"""From: test@example.com
++Subject: Test Email
++Message-ID: <123@example.com>
++
++#3965 test 101
++
++This is the main body of the email.
++-- 
++Signature
++"""
++
++    # В реальном коде mail-parser парсит из байтов, здесь мы просто передаем байты
++    # Примечание: mail-parser требует корректный формат email.
++    # Для теста добавим заголовки в байтовую строку.
++    raw_email_full = b"From: test@example.com\nSubject: Test Email\nMessage-ID: <123@example.com>\n\n#3965 test 101\n\nThis is the main body of the email.\n-- \nSignature"
++
++    result = normalize_email(raw_email_full)
++
++    print(f"Extracted subject: {result['subject']}")
++
++    expected_subject = "#3965 test 101"
++    if result["subject"] == expected_subject:
++        print("✅ Success: Zoho ticket ID and subject correctly extracted.")
++    else:
++        print(f"❌ Error: Expected '{expected_subject}', but got '{result['subject']}'")
++
++
++if __name__ == "__main__":
++    test_zoho_parsing()
+diff --git a/tests/test_rag_chunker.py b/tests/test_rag_chunker.py
+new file mode 100644
+index 0000000..3a98523
+--- /dev/null
++++ b/tests/test_rag_chunker.py
+@@ -0,0 +1,16 @@
++from app.rag.chunker import chunk_text
++
++
++def test_chunker():
++    text = (
++        "This is a test paragraph.\n\nThis is another paragraph that is hopefully long enough to be chunked if we set the size small. "
++        * 10
++    )
++    chunks = chunk_text(text, "test.pdf", 1, "hash123", chunk_size=20, overlap=5)
++    print(f"Total chunks: {len(chunks)}")
++    for i, c in enumerate(chunks):
++        print(f"Chunk {i}: {c.text[:50]}...")
++
++
++if __name__ == "__main__":
++    test_chunker()
+diff --git a/tui_debug.log b/tui_debug.log
+new file mode 100644
+index 0000000..b4dce41
+--- /dev/null
++++ b/tui_debug.log
+@@ -0,0 +1,4 @@
++TUI loaded from: D:\Tasks\lumiring\Support_Sentitel\app\tui\app.py
++Python executable: D:\Python\python.exe
++Current Working Directory: D:\Tasks\lumiring\Support_Sentitel
++sys.path: ['D:\\Tasks\\lumiring\\Support_Sentitel\\app\\tui', 'D:\\Python\\python313.zip', 'D:\\Python\\DLLs', 'D:\\Python\\Lib', 'D:\\Python', 'D:\\Python\\Lib\\site-packages', 'D:\\Python\\Lib\\site-packages\\win32', 'D:\\Python\\Lib\\site-packages\\win32\\lib', 'D:\\Python\\Lib\\site-packages\\Pythonwin']

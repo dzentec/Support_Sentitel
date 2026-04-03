@@ -37,5 +37,12 @@ class Settings:
         if s.strip()
     ]
 
+    # RAG Settings
+    RAG_TOP_K = int(os.getenv("RAG_TOP_K", 5))
+    RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", 0.75))
+    RAG_CHUNK_SIZE = int(os.getenv("RAG_CHUNK_SIZE", 500))
+    RAG_CHUNK_OVERLAP = int(os.getenv("RAG_CHUNK_OVERLAP", 50))
+    ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+
 
 settings = Settings()

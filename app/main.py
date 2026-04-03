@@ -9,6 +9,8 @@ from app.services.imap import poll_imap
 from app.tasks.ticket_tasks import check_reminders, check_auto_close
 from app.config import settings
 from app.scheduler import scheduler
+from app.rag.indexer import index_all_documents
+from app.api.admin import router as admin_router
 
 
 @asynccontextmanager
@@ -16,6 +18,14 @@ async def lifespan(app: FastAPI):
     logger.info("Starting lifespan...")
     await init_db()
     start_scheduler()
+
+    # RAG Indexing
+    logger.info("RAG: Starting knowledge base indexing...")
+    try:
+        stats = await index_all_documents()
+        logger.info(f"RAG: Indexing complete. Stats: {stats}")
+    except Exception as e:
+        logger.error(f"RAG: Indexing failed: {e}", exc_info=True)
 
     # Регистрация задач
     scheduler.add_job(
@@ -65,6 +75,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(admin_router)
 
 
 @app.get("/")
